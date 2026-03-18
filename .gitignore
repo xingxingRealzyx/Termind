@@ -1,0 +1,19 @@
+# 构建产物
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# compile_commands.json（可选保留）
+# compile_commands.json
+
+# 运行时产生
+~/.config/termind/history
