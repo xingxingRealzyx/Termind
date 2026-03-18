@@ -234,7 +234,11 @@ void Repl::HandleConfig() {
               << "  Max Tokens:    " << cfg.max_tokens << "\n"
               << "  Temperature:   " << cfg.temperature << "\n"
               << "  Stream:        " << (cfg.stream ? "是" : "否") << "\n"
-              << "   工具调用上限:  " << cfg.max_tool_iterations << "\n"
+              << "  工具调用上限:  " << cfg.max_tool_iterations << "\n"
+              << "  上下文压缩阈值: "
+              << (cfg.max_context_tokens > 0
+                      ? std::to_string(cfg.max_context_tokens) + " tokens"
+                      : "禁用") << "\n"
               << "  API Key:       "
               << (cfg.api_key.empty() ? utils::color::kRed + std::string("未设置") + utils::color::kReset
                                        : std::string("***") +
@@ -287,9 +291,33 @@ void Repl::HandleAdd(const std::string& args) {
 }
 
 void Repl::HandleTokens() {
-    size_t est = context_.EstimateTokens();
-    std::cout << utils::color::kCyan << "预估 token 用量: "
-              << utils::color::kReset << est << "\n";
+    const auto& cfg = ConfigManager::GetInstance().config();
+    size_t est  = context_.EstimateTokens();
+    int limit   = cfg.max_context_tokens;
+
+    std::cout << utils::color::kCyan << "上下文统计" << utils::color::kReset << "\n"
+              << "  预估 token:    " << est << "\n"
+              << "  压缩阈值:      "
+              << (limit > 0 ? std::to_string(limit) : "禁用") << "\n"
+              << "  已压缩次数:    " << context_.GetCompressCount() << "\n"
+              << "  历史消息条数:  " << context_.GetHistorySize() << "\n"
+              << "  附加文件数:    " << context_.GetFiles().size() << "\n";
+
+    if (limit > 0) {
+        int pct = (limit > 0)
+                  ? static_cast<int>(est * 100 / static_cast<size_t>(limit))
+                  : 0;
+        pct = std::min(pct, 100);
+        int bar_filled = pct * 30 / 100;
+        std::string bar =
+            std::string(pct < 80 ? utils::color::kGreen : utils::color::kYellow) +
+            utils::Repeat("█", bar_filled) +
+            utils::color::kDim +
+            utils::Repeat("░", 30 - bar_filled) +
+            utils::color::kReset;
+        std::cout << "  用量:          [" << bar << "]  " << pct << "%\n";
+    }
+    std::cout << "\n";
 }
 
 // ── AI 代理循环 ───────────────────────────────────────────────────────────
@@ -304,40 +332,92 @@ void Repl::RunAgentLoop(const std::string& user_message) {
     int iterations = 0;
 
     while (iterations++ < cfg.max_tool_iterations) {
+        // ── 上下文压缩（在发送前检查）────────────────────────────────────
+        if (cfg.max_context_tokens > 0) {
+            int dropped = context_.TrimToFit(
+                static_cast<size_t>(cfg.max_context_tokens));
+            if (dropped > 0) {
+                utils::PrintWarning(
+                    "上下文已压缩：丢弃 " + std::to_string(dropped) +
+                    " 条旧消息（当前 ~" +
+                    std::to_string(context_.EstimateTokens()) + " tokens）");
+            }
+        }
+
         auto messages = context_.GetMessages();
 
         std::cout << "\n";
 
-        // ── 启动思考动画 ──────────────────────────────────────────────────
-        utils::Spinner spinner;
-        spinner.Start("思考中… (" + std::to_string(iterations) + "/" +
-                       std::to_string(cfg.max_tool_iterations) + ")");
+        // ── 启动思考预览面板 ──────────────────────────────────────────────
+        utils::ThinkingPane pane;
+        pane.Start("思考中… (" + std::to_string(iterations) + "/" +
+                   std::to_string(cfg.max_tool_iterations) + ")");
 
         ChatResponse response;
 
         if (cfg.stream) {
-            // 第一个文字 chunk 到达时停止 spinner，再输出头部标记
-            bool first_chunk = true;
+            // 状态追踪
+            bool   first_chunk    = true;   // 尚未收到第一个文字 chunk
+            bool   text_shown     = false;  // 已经有文字输出到屏幕
+            size_t tool_arg_chars = 0;
+            std::string current_tool;
+
             response = ai_client_->ChatStream(
                 messages, tools,
-                [&first_chunk, &spinner](const std::string& chunk) {
+                // ── 文字流回调 ─────────────────────────────────────────
+                // 第一个文字 chunk 到达时：关闭面板，打印 AI 发言头部
+                [&](const std::string& chunk) {
                     if (first_chunk) {
-                        // 清除 spinner 行，打印 AI 发言头部
-                        spinner.Stop();
+                        pane.Stop();  // 清除思考面板
+                        // 头部与用户提示符格式一致：Termind <badge> ❯
                         std::cout << utils::color::kBrightGreen
                                   << "Termind" << utils::color::kReset
-                                  << utils::color::kDim << " ❯ "
+                                  << " " << BuildContextBadge()
+                                  << utils::color::kDim << "❯ "
                                   << utils::color::kReset;
                         first_chunk = false;
                     }
                     std::cout << chunk;
                     std::cout.flush();
+                    text_shown = true;
+                },
+                // ── 工具参数流回调 ─────────────────────────────────────
+                // 情况 A：纯工具调用（无文字），面板一直运行，直接更新标题
+                // 情况 B：文字之后才来工具参数，面板已停 —— 换行后重启
+                [&](const std::string& tool_name,
+                    const std::string& arg_chunk) {
+                    if (!pane.IsRunning()) {
+                        // 情况 B：文字刚输出完，面板已被停止
+                        if (text_shown) {
+                            std::cout << "\n";  // 结束文字行
+                            text_shown = false;
+                        }
+                        current_tool   = tool_name;
+                        tool_arg_chars = 0;
+                        pane.Start(std::string(utils::color::kYellow) +
+                                   "⚡ " + utils::color::kReset +
+                                   utils::color::kDim + tool_name +
+                                   "  " + utils::color::kReset + "0 字符…");
+                    } else if (tool_name != current_tool) {
+                        // 同一轮内切换到下一个工具调用
+                        current_tool   = tool_name;
+                        tool_arg_chars = 0;
+                    }
+                    tool_arg_chars += arg_chunk.size();
+                    pane.SetHeading(
+                        std::string(utils::color::kYellow) + "⚡ " +
+                        utils::color::kReset +
+                        utils::color::kDim + tool_name + "  " +
+                        utils::color::kReset +
+                        std::to_string(tool_arg_chars) + " 字符…");
+                    pane.Feed(arg_chunk);
                 });
-            // 若整轮均为工具调用（无文字 chunk），保证 spinner 已清除
-            spinner.Stop();
+
+            // ChatStream 返回后清除面板（工具参数或纯思考结束）
+            pane.Stop();
         } else {
             response = ai_client_->Chat(messages, tools);
-            spinner.Stop();
+            pane.Stop();
         }
 
         // ── 请求失败 ──────────────────────────────────────────────────────
@@ -349,10 +429,11 @@ void Repl::RunAgentLoop(const std::string& user_message) {
         // ── 最终文字回答（无工具调用）────────────────────────────────────
         if (!response.HasToolCalls()) {
             if (!cfg.stream) {
-                // 非流式：整体打印
+                // 非流式：整体打印（头部与流式一致）
                 std::cout << utils::color::kBrightGreen
                           << "Termind" << utils::color::kReset
-                          << utils::color::kDim << " ❯ "
+                          << " " << BuildContextBadge()
+                          << utils::color::kDim << "❯ "
                           << utils::color::kReset
                           << response.content;
             }
@@ -583,6 +664,49 @@ void Repl::PrintWelcome() const {
               << utils::color::kReset << "\n";
 }
 
+// ── 上下文 token 徽章（提示符和 AI 回答头部共用）─────────────────────────
+// 格式："42% 34k/80k "（启用压缩）或 "34k "（禁用），颜色随用量变化
+
+std::string Repl::BuildContextBadge() const {
+    const auto& cfg = ConfigManager::GetInstance().config();
+    size_t est = context_.EstimateTokens();
+
+    // 紧凑 token 格式：>= 1000 用 "XXk"，否则直接显示数字
+    auto fmt_tok = [](size_t n) -> std::string {
+        if (n >= 1000) {
+            size_t k = n / 1000;
+            size_t r = (n % 1000) / 100;
+            if (r == 0) return std::to_string(k) + "k";
+            return std::to_string(k) + "." + std::to_string(r) + "k";
+        }
+        return std::to_string(n);
+    };
+
+    if (cfg.max_context_tokens > 0) {
+        int limit = cfg.max_context_tokens;
+        int pct   = static_cast<int>(est * 100 / static_cast<size_t>(limit));
+        pct = std::min(pct, 100);
+
+        const char* clr;
+        if      (pct < 60) clr = utils::color::kBrightGreen;
+        else if (pct < 80) clr = utils::color::kYellow;
+        else               clr = utils::color::kRed;
+
+        return std::string(clr) +
+               std::to_string(pct) + "% " +
+               fmt_tok(est) + "/" + fmt_tok(static_cast<size_t>(limit)) +
+               utils::color::kReset + " ";
+    }
+
+    if (est > 0) {
+        return std::string(utils::color::kDim) +
+               fmt_tok(est) +
+               utils::color::kReset + " ";
+    }
+
+    return {};
+}
+
 // ── 构建提示符 ────────────────────────────────────────────────────────────
 
 std::string Repl::BuildPrompt() const {
@@ -591,8 +715,9 @@ std::string Repl::BuildPrompt() const {
 
     return std::string(utils::color::kBold) +
            utils::color::kBrightCyan + "termind" +
-           utils::color::kReset +
-           utils::color::kDim + " " + cwd + " " +
+           utils::color::kReset + " " +
+           BuildContextBadge() +
+           utils::color::kDim + cwd + " " +
            utils::color::kReset +
            utils::color::kBrightCyan + "❯ " +
            utils::color::kReset;

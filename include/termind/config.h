@@ -18,6 +18,11 @@ struct Config {
     bool auto_approve_reads = true;   // 读操作无需确认
     int max_tool_iterations = 50;     // 最多工具调用循环次数
 
+    // 上下文压缩
+    // 超过此 token 估算值时触发自动压缩（0 = 禁用）
+    // 压缩策略：先截断旧工具结果 → 再丢弃最老的完整对话轮次
+    int max_context_tokens = 80000;
+
     // 系统提示词（可由配置文件覆盖）
     std::string system_prompt;
 };

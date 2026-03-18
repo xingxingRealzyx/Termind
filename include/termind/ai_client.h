@@ -56,8 +56,14 @@ struct ChatResponse {
     bool HasToolCalls() const { return !tool_calls.empty(); }
 };
 
-// 文字流回调类型
+// 文字流回调：每个文字增量 chunk
 using TextChunkCallback = std::function<void(const std::string& chunk)>;
+
+// 工具参数流回调：AI 正在构建工具调用时，每个参数增量 chunk 触发
+// tool_name 可能在首个 chunk 后才非空（OpenAI 流协议）
+using ToolArgChunkCallback =
+    std::function<void(const std::string& tool_name,
+                       const std::string& arg_chunk)>;
 
 // ── AI 客户端 ─────────────────────────────────────────────────────────────
 class AiClient {
@@ -68,10 +74,11 @@ public:
     ChatResponse Chat(const std::vector<Message>& messages,
                        const std::vector<nlohmann::json>& tools = {});
 
-    // 流式请求（最终回答时使用，文字块通过回调实时输出）
+    // 流式请求：文字块和工具参数块都通过回调实时推送
     ChatResponse ChatStream(const std::vector<Message>& messages,
                              const std::vector<nlohmann::json>& tools = {},
-                             TextChunkCallback on_text_chunk = nullptr);
+                             TextChunkCallback    on_text_chunk     = nullptr,
+                             ToolArgChunkCallback on_tool_arg_chunk = nullptr);
 
 private:
     // SSE 流式解析中间状态
@@ -87,7 +94,8 @@ private:
         std::vector<PartialToolCall> tool_calls;
         std::string finish_reason;
         bool finished = false;
-        TextChunkCallback text_callback;
+        TextChunkCallback    text_callback;
+        ToolArgChunkCallback tool_arg_callback;
     };
 
     static size_t WriteCallback(char* ptr, size_t size, size_t nmemb,
@@ -99,7 +107,8 @@ private:
 
     ChatResponse ParseResponse(const std::string& body);
     ChatResponse DoRequest(const std::string& payload, bool use_stream,
-                            TextChunkCallback on_text_chunk);
+                            TextChunkCallback    on_text_chunk,
+                            ToolArgChunkCallback on_tool_arg_chunk = nullptr);
     std::string BuildPayload(const std::vector<Message>& messages,
                               const std::vector<nlohmann::json>& tools,
                               bool stream) const;

@@ -177,8 +177,14 @@ void AiClient::ProcessStreamChunk(const nlohmann::json& chunk,
                 const auto& fn = tc["function"];
                 if (fn.contains("name") && fn["name"].is_string())
                     ptc.name = fn["name"].get<std::string>();
-                if (fn.contains("arguments") && fn["arguments"].is_string())
-                    ptc.raw_arguments += fn["arguments"].get<std::string>();
+                if (fn.contains("arguments") && fn["arguments"].is_string()) {
+                    std::string arg_chunk = fn["arguments"].get<std::string>();
+                    ptc.raw_arguments += arg_chunk;
+                    // 触发工具参数流回调（供 UI 显示进度）
+                    if (ctx->tool_arg_callback && !arg_chunk.empty()) {
+                        ctx->tool_arg_callback(ptc.name, arg_chunk);
+                    }
+                }
             }
         }
     }
@@ -257,7 +263,8 @@ std::string AiClient::BuildPayload(const std::vector<Message>& messages,
 // ── 执行 HTTP 请求 ────────────────────────────────────────────────────────
 
 ChatResponse AiClient::DoRequest(const std::string& payload, bool use_stream,
-                                   TextChunkCallback on_text_chunk) {
+                                   TextChunkCallback    on_text_chunk,
+                                   ToolArgChunkCallback on_tool_arg_chunk) {
     CURL* curl = curl_easy_init();
     if (!curl) return {false, "初始化 CURL 失败"};
 
@@ -281,7 +288,8 @@ ChatResponse AiClient::DoRequest(const std::string& payload, bool use_stream,
 
     if (use_stream) {
         StreamContext ctx;
-        ctx.text_callback = on_text_chunk;
+        ctx.text_callback     = on_text_chunk;
+        ctx.tool_arg_callback = on_tool_arg_chunk;
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
 
@@ -358,13 +366,14 @@ ChatResponse AiClient::Chat(const std::vector<Message>& messages,
 
 ChatResponse AiClient::ChatStream(const std::vector<Message>& messages,
                                     const std::vector<nlohmann::json>& tools,
-                                    TextChunkCallback on_text_chunk) {
+                                    TextChunkCallback    on_text_chunk,
+                                    ToolArgChunkCallback on_tool_arg_chunk) {
     if (api_key_.empty()) {
         return {false, "未设置 API Key。请设置环境变量 TERMIND_API_KEY 或 OPENAI_API_KEY，"
                        "或在 ~/.config/termind/config.json 中配置。"};
     }
     std::string payload = BuildPayload(messages, tools, true);
-    return DoRequest(payload, true, on_text_chunk);
+    return DoRequest(payload, true, on_text_chunk, on_tool_arg_chunk);
 }
 
 }  // namespace termind

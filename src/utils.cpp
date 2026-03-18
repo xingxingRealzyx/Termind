@@ -345,5 +345,156 @@ void Spinner::ThreadFunc() {
     }
 }
 
+// ── ThinkingPane ──────────────────────────────────────────────────────────
+
+namespace {
+constexpr const char* kPaneFrames[] = {
+    "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+constexpr int kPaneNumFrames = 10;
+}  // namespace
+
+void ThinkingPane::Start(const std::string& heading) {
+    if (running_.exchange(true)) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        heading_        = heading;
+        content_buf_.clear();
+        rendered_lines_ = 0;
+        frame_          = 0;
+    }
+    thread_ = std::thread([this] { Loop(); });
+}
+
+void ThinkingPane::SetHeading(const std::string& heading) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    heading_ = heading;
+}
+
+void ThinkingPane::Feed(const std::string& chunk) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < chunk.size(); ++i) {
+        char c = chunk[i];
+        if (c == '\r') continue;
+        // 展开 JSON 字符串转义（工具参数里常见）
+        if (c == '\\' && i + 1 < chunk.size()) {
+            char nx = chunk[i + 1];
+            if (nx == 'n')  { content_buf_ += '\n'; ++i; continue; }
+            if (nx == 't')  { content_buf_ += '\t'; ++i; continue; }
+            if (nx == '\\') { content_buf_ += '\\'; ++i; continue; }
+            if (nx == '"')  { content_buf_ += '"';  ++i; continue; }
+        }
+        content_buf_ += c;
+    }
+}
+
+void ThinkingPane::Stop() {
+    if (!running_.exchange(false)) return;
+    if (thread_.joinable()) thread_.join();
+    // 后台线程已退出，可安全操作 stdout
+    std::lock_guard<std::mutex> lock(mutex_);
+    ClearLines();  // 单次 write 原子清除
+}
+
+void ThinkingPane::Loop() {
+    while (running_.load(std::memory_order_relaxed)) {
+        if (isatty(STDOUT_FILENO)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Render();  // 清除 + 重绘合并为单次 write，无中间空白帧
+        }
+        ++frame_;
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+}
+
+void ThinkingPane::ClearLines() {
+    // 供 Stop() 调用：单次 write 原子擦除渲染区域
+    if (rendered_lines_ == 0) return;
+    std::string out = "\033[" + std::to_string(rendered_lines_) + "A\033[J";
+    ::write(STDOUT_FILENO, out.data(), out.size());
+    rendered_lines_ = 0;
+}
+
+void ThinkingPane::Render() {
+    // 将清除 + 新内容合并进一个 string，最后一次 ::write() 原子输出。
+    // 这样终端永远不会看到"清空后、新内容到达前"的中间空白帧，消除闪烁。
+    std::string out;
+    out.reserve(1024);
+
+    // ① 清除上一帧（若有）
+    if (rendered_lines_ > 0) {
+        out += "\033[";
+        out += std::to_string(rendered_lines_);
+        out += "A\033[J";
+    }
+
+    // ② 行 1：spinner + 标题
+    out += color::kDim;
+    out += kPaneFrames[frame_ % kPaneNumFrames];
+    out += " ";
+    out += heading_;
+    out += color::kReset;
+    out += "\n";
+    int printed = 1;
+
+    // ③ 行 2..N+1：内容预览（有内容时才输出）
+    if (!content_buf_.empty()) {
+        int tw = GetTerminalWidth();
+        int pw = std::max(20, tw - 6);
+        for (const auto& ln : LastLines(pw)) {
+            out += color::kDim;
+            out += "  ╎ ";
+            out += ln;
+            out += color::kReset;
+            out += "\n";
+            ++printed;
+        }
+    }
+
+    rendered_lines_ = printed;
+
+    // ④ 单次系统调用写出，避免多次写之间的撕裂
+    ::write(STDOUT_FILENO, out.data(), out.size());
+}
+
+std::vector<std::string> ThinkingPane::LastLines(int width) const {
+    // 按 \n 分割 content_buf_
+    std::vector<std::string> raw;
+    std::string cur;
+    for (char c : content_buf_) {
+        if (c == '\n') {
+            raw.push_back(cur);
+            cur.clear();
+        } else if (c == '\t') {
+            cur += "    ";
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) raw.push_back(cur);
+
+    // 过滤纯空白行
+    std::vector<std::string> lines;
+    for (const auto& l : raw) {
+        bool blank = true;
+        for (unsigned char c : l) {
+            if (!std::isspace(c)) { blank = false; break; }
+        }
+        if (!blank) lines.push_back(l);
+    }
+
+    // 取最后 kPreviewLines 行，超宽截断
+    int start = std::max(0, static_cast<int>(lines.size()) - kPreviewLines);
+    std::vector<std::string> out;
+    for (int i = start; i < static_cast<int>(lines.size()); ++i) {
+        const std::string& l = lines[i];
+        if (static_cast<int>(l.size()) <= width) {
+            out.push_back(l);
+        } else {
+            out.push_back(l.substr(0, static_cast<size_t>(width) - 1) + "…");
+        }
+    }
+    return out;
+}
+
 }  // namespace utils
 }  // namespace termind

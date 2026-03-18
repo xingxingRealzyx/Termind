@@ -147,8 +147,84 @@ std::vector<Message> ContextManager::GetMessages() const {
 size_t ContextManager::EstimateTokens() const {
     size_t chars = system_message_.size();
     for (const auto& fc : file_contexts_) chars += fc.content.size();
-    for (const auto& m : history_) chars += m.content.size();
+    for (const auto& m : history_) {
+        chars += m.content.size();
+        // tool_calls 的 JSON 也计入
+        if (m.tool_calls) {
+            for (const auto& tc : *m.tool_calls)
+                chars += tc.name.size() + tc.arguments.dump().size();
+        }
+    }
     return chars / 4;  // 粗略估算：4 字符 ≈ 1 token
+}
+
+// ── 上下文压缩 ────────────────────────────────────────────────────────────
+
+// 从后往前找第 n 个 user 消息的下标；找不到返回 history_.size()
+size_t ContextManager::FindUserTurnBoundary(int n_from_end) const {
+    int count = 0;
+    for (int i = static_cast<int>(history_.size()) - 1; i >= 0; --i) {
+        if (history_[i].role == MessageRole::kUser) {
+            ++count;
+            if (count == n_from_end)
+                return static_cast<size_t>(i);
+        }
+    }
+    return history_.size();  // 未找到
+}
+
+int ContextManager::TrimToFit(size_t max_tokens,
+                                int keep_recent_turns,
+                                size_t old_tool_max_chars) {
+    if (max_tokens == 0 || EstimateTokens() <= max_tokens) return 0;
+
+    int dropped = 0;
+
+    // ── 阶段 1：截断旧工具结果 ───────────────────────────────────────────
+    // 找到"保留区"起始：从后往前第 keep_recent_turns 个 user 消息
+    size_t keep_from = FindUserTurnBoundary(keep_recent_turns);
+
+    for (size_t i = 0; i < keep_from && i < history_.size(); ++i) {
+        auto& msg = history_[i];
+        if (msg.role == MessageRole::kTool &&
+            msg.content.size() > old_tool_max_chars) {
+            size_t orig = msg.content.size();
+            msg.content = msg.content.substr(0, old_tool_max_chars) +
+                          "\n… [已压缩，原 " + std::to_string(orig) +
+                          " 字符，省略 " +
+                          std::to_string(orig - old_tool_max_chars) + " 字符]";
+        }
+    }
+
+    // ── 阶段 2：丢弃最老的完整对话轮次 ──────────────────────────────────
+    // 每次循环：找到第一个 user 消息之后的下一个 user 消息位置，
+    // 把 [0, next_user) 整段丢弃（保留至少 keep_recent_turns 个轮次）
+    while (EstimateTokens() > max_tokens) {
+        // 至少保留最后 keep_recent_turns 个完整轮次
+        size_t safe_keep = FindUserTurnBoundary(keep_recent_turns);
+        if (safe_keep == 0 || safe_keep >= history_.size()) break;
+
+        // 找第一个 user 之后的下一个 user（即第二个 user）的位置
+        size_t next_user = history_.size();
+        for (size_t i = 1; i < safe_keep; ++i) {
+            if (history_[i].role == MessageRole::kUser) {
+                next_user = i;
+                break;
+            }
+        }
+        if (next_user >= safe_keep) break;  // 找不到可丢弃的轮次
+
+        dropped += static_cast<int>(next_user);
+        history_.erase(history_.begin(),
+                        history_.begin() + static_cast<std::ptrdiff_t>(next_user));
+    }
+
+    if (dropped > 0 || /* phase1 changed something */ true) {
+        // 只有真正丢弃了消息才计数
+        if (dropped > 0) ++compress_count_;
+    }
+
+    return dropped;
 }
 
 // ── 私有方法 ──────────────────────────────────────────────────────────────

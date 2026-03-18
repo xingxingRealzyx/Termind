@@ -88,19 +88,12 @@ public:
     Spinner() = default;
     ~Spinner() { Stop(); }
 
-    // 禁止拷贝
-    Spinner(const Spinner&) = delete;
+    Spinner(const Spinner&)            = delete;
     Spinner& operator=(const Spinner&) = delete;
 
-    // 开始动画，message 显示在旋转符号右侧
     void Start(const std::string& message);
-
-    // 停止动画并清除当前行（可多次调用，幂等）
     void Stop();
-
-    // 更新显示消息（线程安全）
     void SetMessage(const std::string& message);
-
     bool IsRunning() const { return running_.load(std::memory_order_relaxed); }
 
 private:
@@ -110,6 +103,50 @@ private:
     std::string        message_;
     std::mutex         message_mutex_;
     std::thread        thread_;
+};
+
+// ── 多行思考预览面板 ThinkingPane ─────────────────────────────────────────
+// 后台线程负责动画刷新；主线程通过 Feed() 注入实时流内容（文字或工具参数）。
+// 渲染：第 1 行是 spinner + 标题，第 2-5 行是内容的最后 N 行滚动预览。
+// Stop() 等待后台线程并清除所有渲染行，之后可安全写 stdout。
+class ThinkingPane {
+public:
+    static constexpr int kPreviewLines = 4;  // 内容预览区最大行数
+
+    ThinkingPane() = default;
+    ~ThinkingPane() { Stop(); }
+
+    ThinkingPane(const ThinkingPane&)            = delete;
+    ThinkingPane& operator=(const ThinkingPane&) = delete;
+
+    // 开始显示，heading 作为标题行
+    void Start(const std::string& heading);
+
+    // 更新标题行（线程安全）
+    void SetHeading(const std::string& heading);
+
+    // 注入内容 chunk（线程安全）；自动展开 JSON \n \t 转义
+    void Feed(const std::string& chunk);
+
+    // 停止并清除所有渲染行（可多次调用，幂等）
+    void Stop();
+
+    bool IsRunning() const { return running_.load(std::memory_order_relaxed); }
+
+private:
+    void Loop();
+    void Render();      // 调用方必须持有 mutex_
+    void ClearLines();  // 调用方必须持有 mutex_
+    std::vector<std::string> LastLines(int width) const;  // 调用方必须持有 mutex_
+
+    std::string       heading_;
+    std::string       content_buf_;
+    int               rendered_lines_ = 0;
+    size_t            frame_          = 0;
+
+    std::atomic<bool> running_{false};
+    std::thread       thread_;
+    std::mutex        mutex_;
 };
 
 }  // namespace utils

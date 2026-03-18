@@ -55,14 +55,34 @@ public:
     // 预估 token 数（按 4 字符 ≈ 1 token 粗算）
     size_t EstimateTokens() const;
 
+    // ── 上下文压缩 ────────────────────────────────────────────────────────
+    // 当 EstimateTokens() > max_tokens 时自动压缩：
+    //   阶段 1：将 keep_recent_turns 之前的旧工具结果截断到 old_tool_max_chars
+    //   阶段 2：逐步丢弃最老的完整对话轮次，直到低于 max_tokens
+    // 返回实际丢弃的消息数量（0 = 未压缩）
+    int TrimToFit(size_t max_tokens,
+                   int keep_recent_turns = 2,
+                   size_t old_tool_max_chars = 800);
+
+    // 历史上累计触发压缩的次数
+    int GetCompressCount() const { return compress_count_; }
+
+    // 当前对话历史条数（不含系统消息和文件上下文）
+    size_t GetHistorySize() const { return history_.size(); }
+
 private:
     static std::string DetectLanguage(const std::filesystem::path& path);
     std::string BuildFilesBlock() const;
+
+    // 在 history_ 中找到"第 n 个 user 消息"的下标（从后往前数第 n 个）
+    // 返回 history_.size() 表示未找到
+    size_t FindUserTurnBoundary(int n_from_end) const;
 
     std::string system_message_;
     std::vector<FileContext> file_contexts_;
     std::vector<Message> history_;
     std::filesystem::path working_dir_;
+    int compress_count_ = 0;
 };
 
 }  // namespace termind

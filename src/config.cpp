@@ -64,6 +64,7 @@ bool ConfigManager::LoadFromFile(const std::string& path) {
         get_bool("auto_approve_reads", config_.auto_approve_reads);
         get_int("max_tool_iterations", config_.max_tool_iterations);
         get_str("system_prompt",       config_.system_prompt);
+        get_int("max_context_tokens",  config_.max_context_tokens);
 
         return true;
     } catch (const std::exception& e) {
@@ -117,6 +118,7 @@ bool ConfigManager::SaveToFile(const std::string& path) const {
     j["auto_approve_reads"]  = config_.auto_approve_reads;
     j["max_tool_iterations"] = config_.max_tool_iterations;
     j["system_prompt"]       = config_.system_prompt;
+    j["max_context_tokens"]  = config_.max_context_tokens;
 
     std::ofstream f(config_path);
     if (!f.is_open()) return false;

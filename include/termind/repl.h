@@ -60,6 +60,9 @@ private:
     // ── 显示 ──────────────────────────────────────────────────────────────
     void PrintWelcome() const;
     std::string BuildPrompt() const;
+    // 生成带颜色的上下文 token 徽章，供提示符和 AI 回答头部共用
+    // 格式："42% 34k/80k "（启用压缩）或 "34k "（禁用）
+    std::string BuildContextBadge() const;
     void PrintToolCallHeader(const ToolCallRequest& tc) const;
 
     // ── 状态 ──────────────────────────────────────────────────────────────
