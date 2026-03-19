@@ -32,6 +32,8 @@ private:
     std::filesystem::path FindProjectMemoryPath() const;
     // 重建 system message：base_system_prompt + skills 摘要 + 项目记忆
     void RebuildSystemMessage();
+    // 注册 update_project_memory 工具（捕获 this，需在每次 InitProjectMemory 后调用）
+    void RegisterMemoryTool();
     std::string ReadLine(const std::string& prompt);
 
     // ── 处理输入 ──────────────────────────────────────────────────────────

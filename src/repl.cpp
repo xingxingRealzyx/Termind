@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <sstream>
 
 #include <readline/history.h>
@@ -66,6 +67,14 @@ void Repl::RebuildSystemMessage() {
     if (!project_memory_content_.empty()) {
         sys += "\n\n---\n## 项目记忆（TERMIND.md）\n\n";
         sys += project_memory_content_;
+        sys += "\n\n> **记忆更新指引**：当对话中出现以下内容时，"
+               "主动调用 `update_project_memory` 工具将其保存到 TERMIND.md：\n"
+               "> - 构建/运行/测试命令\n"
+               "> - 代码规范与命名约定\n"
+               "> - 架构决策或模块说明\n"
+               "> - 重要文件/配置路径\n"
+               "> - 已知问题或特殊依赖\n"
+               "> 每次对话结束前，若发现值得长期记住的信息，请主动更新。\n";
     }
 
     context_.SetSystemMessage(sys);
@@ -127,6 +136,165 @@ void Repl::InitProjectMemory() {
     }
 
     RebuildSystemMessage();
+    RegisterMemoryTool();
+}
+
+// ── update_project_memory 工具注册 ───────────────────────────────────────
+//
+// 此工具捕获 this 指针，在 AI 对话中按段更新 TERMIND.md。
+// 若 TERMIND.md 不存在，工具以禁用形式注册（调用时报错提示创建）。
+//
+// section 匹配规则（大小写不敏感，前缀匹配）：
+//   - "构建" 匹配 "## 构建与运行"
+//   - 若找不到匹配段，追加为新段
+//
+// 更新流程：
+//   1. 解析 TERMIND.md 各段
+//   2. 显示 diff（删除行红色，新增行绿色）
+//   3. 请求用户确认
+//   4. 写入文件并 reload
+
+static std::string UpdateSection(const std::string& doc,
+                                  const std::string& section_title,
+                                  const std::string& new_content) {
+    // 将文档按 "## " 头分割
+    // 找到完整匹配的 section（大小写不敏感）
+    std::string lower_title = section_title;
+    std::transform(lower_title.begin(), lower_title.end(),
+                   lower_title.begin(), ::tolower);
+
+    // 逐行扫描，定位 section 的起止
+    auto lines = utils::Split(doc, '\n');
+    int section_start = -1;  // ## 行的下标
+    int section_end   = static_cast<int>(lines.size());  // 下一个 ## 行（不含）
+
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+        const std::string& ln = lines[i];
+        if (ln.size() >= 3 && ln[0] == '#' && ln[1] == '#' && ln[2] == ' ') {
+            if (section_start == -1) {
+                // 检查是否匹配
+                std::string hdr = ln.substr(3);
+                std::string lower_hdr = hdr;
+                std::transform(lower_hdr.begin(), lower_hdr.end(),
+                               lower_hdr.begin(), ::tolower);
+                if (lower_hdr.find(lower_title) != std::string::npos ||
+                    lower_title.find(lower_hdr) != std::string::npos) {
+                    section_start = i;
+                }
+            } else {
+                // 找到了 section_start，这行是下一个 section
+                section_end = i;
+                break;
+            }
+        }
+    }
+
+    std::ostringstream result;
+    if (section_start == -1) {
+        // 未找到对应段，追加到文档末尾
+        result << doc;
+        if (!doc.empty() && doc.back() != '\n') result << "\n";
+        result << "\n## " << section_title << "\n\n" << new_content << "\n";
+    } else {
+        // 重建文档：section 头 + 新内容 + 剩余
+        for (int i = 0; i < section_start; ++i)
+            result << lines[i] << "\n";
+        result << lines[section_start] << "\n\n";  // ## 标题行
+        result << new_content;
+        if (!new_content.empty() && new_content.back() != '\n') result << "\n";
+        result << "\n";
+        for (int i = section_end; i < static_cast<int>(lines.size()); ++i)
+            result << lines[i] << "\n";
+    }
+    return result.str();
+}
+
+void Repl::RegisterMemoryTool() {
+    // 注册工具，捕获 this（Repl 生命周期覆盖所有工具调用）
+    ToolRegistry::GetInstance().Register({
+        {
+            "update_project_memory",
+            "将对话中发现的重要项目信息写入 TERMIND.md（项目记忆文件）。"
+            "当发现以下类型的信息时主动调用：构建/运行/测试命令、代码规范与约定、"
+            "架构决策、重要文件路径、已知问题或特殊依赖。"
+            "会显示改动 diff 并请求用户确认后再写入。",
+            {
+                {"section",  "string",
+                 "要更新的章节标题，如【构建与运行】、【注意事项】、【架构说明】等，"
+                 "大小写不敏感，支持前缀匹配。若章节不存在将自动追加。",
+                 true},
+                {"content",  "string",
+                 "该章节的完整新内容（Markdown 格式，不含 ## 标题行）。",
+                 true},
+            }
+        },
+        [this](const nlohmann::json& args) -> ToolResult {
+            if (project_memory_path_.empty()) {
+                return {false,
+                        "当前目录没有 TERMIND.md，请先执行 /memory init 创建。"};
+            }
+
+            std::string section = args.at("section").get<std::string>();
+            std::string content = args.at("content").get<std::string>();
+
+            // 生成更新后的文档
+            std::string updated = UpdateSection(
+                project_memory_content_, section, content);
+
+            // 显示 diff（简单行级：删去旧行、加入新行）
+            std::cout << "\n" << utils::color::kBold
+                      << "  📋 update_project_memory [" << section << "]"
+                      << utils::color::kReset << "\n\n";
+
+            auto old_lines = utils::Split(project_memory_content_, '\n');
+            auto new_lines = utils::Split(updated, '\n');
+
+            // 只显示变化的上下文（简单差异：行集合对比）
+            std::set<std::string> old_set(old_lines.begin(), old_lines.end());
+            std::set<std::string> new_set(new_lines.begin(), new_lines.end());
+
+            bool any_diff = false;
+            for (const auto& ln : old_lines) {
+                if (!new_set.count(ln)) {
+                    std::cout << utils::color::kRed << "  - " << ln
+                              << utils::color::kReset << "\n";
+                    any_diff = true;
+                }
+            }
+            for (const auto& ln : new_lines) {
+                if (!old_set.count(ln)) {
+                    std::cout << utils::color::kGreen << "  + " << ln
+                              << utils::color::kReset << "\n";
+                    any_diff = true;
+                }
+            }
+
+            if (!any_diff) {
+                return {true, "内容与现有记忆相同，无需更新。"};
+            }
+            std::cout << "\n";
+
+            // 确认
+            char choice = utils::AskYesNoEdit("将此变更写入 TERMIND.md?");
+            std::cout << "\n";
+            if (choice == 'n') {
+                return {false, "用户已取消记忆更新。"};
+            }
+
+            // 写入
+            if (!utils::WriteFile(project_memory_path_, updated)) {
+                return {false, "写入 TERMIND.md 失败: " +
+                               project_memory_path_.string()};
+            }
+
+            // 热更新
+            project_memory_content_ = updated;
+            RebuildSystemMessage();
+
+            return {true, "✅ TERMIND.md [" + section + "] 已更新"};
+        },
+        false  // 工具内部自行处理确认，不走外部 requires_confirmation 流程
+    });
 }
 
 // ── readline 初始化 ───────────────────────────────────────────────────────
