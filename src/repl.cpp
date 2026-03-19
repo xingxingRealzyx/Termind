@@ -23,18 +23,21 @@ Repl::Repl() : ai_client_(std::make_unique<AiClient>()) {
     // 工作目录默认为当前目录
     context_.SetWorkingDir(fs::current_path());
 
-    // 若配置文件有自定义系统提示词则覆盖默认
+    // 保存基础 system prompt（配置文件 > 默认值）
     const auto& cfg = ConfigManager::GetInstance().config();
-    if (!cfg.system_prompt.empty()) {
-        context_.SetSystemMessage(cfg.system_prompt);
-    }
+    base_system_prompt_ = cfg.system_prompt.empty()
+                              ? context_.GetSystemMessage()  // 使用 ContextManager 默认值
+                              : cfg.system_prompt;
 
     // 注册内置工具
     RegisterBuiltinTools(ToolRegistry::GetInstance(),
                          context_.GetWorkingDir().string());
 
-    // ── 初始化 SkillManager ────────────────────────────────────────────
+    // ── 初始化 Skills（会调用 RebuildSystemMessage）──────────────────
     InitSkills();
+
+    // ── 初始化项目记忆（会调用 RebuildSystemMessage）────────────────
+    InitProjectMemory();
 
     InitReadline();
 }
@@ -44,6 +47,28 @@ Repl::~Repl() {
     std::string hist_path =
         utils::ExpandHome("~/.config/termind/history");
     write_history(hist_path.c_str());
+}
+
+// ── System Message 重建 ───────────────────────────────────────────────────
+//
+// 组装顺序：基础提示词 → Skills 摘要 → 项目记忆（TERMIND.md）
+
+void Repl::RebuildSystemMessage() {
+    std::string sys = base_system_prompt_;
+
+    // 追加 Skills 摘要
+    auto& sm = SkillManager::GetInstance();
+    if (sm.HasSkills()) {
+        sys += "\n\n" + sm.GetSummaryBlock();
+    }
+
+    // 追加项目记忆
+    if (!project_memory_content_.empty()) {
+        sys += "\n\n---\n## 项目记忆（TERMIND.md）\n\n";
+        sys += project_memory_content_;
+    }
+
+    context_.SetSystemMessage(sys);
 }
 
 // ── Skills 初始化 ─────────────────────────────────────────────────────────
@@ -66,13 +91,42 @@ void Repl::InitSkills() {
     dirs.push_back(context_.GetWorkingDir() / ".termind" / "skills");
 
     sm.LoadFromDirs(dirs);
+    // 注意：调用方（构造函数）在 InitProjectMemory 之后统一调用 RebuildSystemMessage
+    // 此处不单独重建，避免后续又被 InitProjectMemory 覆盖
+}
 
-    // 若有可用 Skills，在 system message 后追加摘要块
-    if (sm.HasSkills()) {
-        std::string sys = context_.GetSystemMessage();
-        sys += "\n\n" + sm.GetSummaryBlock();
-        context_.SetSystemMessage(sys);
+// ── 项目记忆 ──────────────────────────────────────────────────────────────
+
+fs::path Repl::FindProjectMemoryPath() const {
+    // 从工作目录向上查找 TERMIND.md，直到找到 .git 根或文件系统根
+    fs::path dir = context_.GetWorkingDir();
+
+    for (int depth = 0; depth < 10; ++depth) {
+        fs::path candidate = dir / "TERMIND.md";
+        if (fs::exists(candidate)) return candidate;
+
+        // 到达 git 根就停止（不再继续向上）
+        if (fs::exists(dir / ".git")) break;
+
+        fs::path parent = dir.parent_path();
+        if (parent == dir) break;  // 已到文件系统根
+        dir = parent;
     }
+    return {};  // 未找到
+}
+
+void Repl::InitProjectMemory() {
+    project_memory_path_    = FindProjectMemoryPath();
+    project_memory_content_ = "";
+
+    if (!project_memory_path_.empty()) {
+        auto content = utils::ReadFile(project_memory_path_);
+        if (content) {
+            project_memory_content_ = *content;
+        }
+    }
+
+    RebuildSystemMessage();
 }
 
 // ── readline 初始化 ───────────────────────────────────────────────────────
@@ -163,6 +217,7 @@ bool Repl::DispatchCommand(const std::string& cmd, const std::string& args) {
     if (cmd == "add"   || cmd == "a")               { HandleAdd(args);       return true; }
     if (cmd == "tokens")                            { HandleTokens();        return true; }
     if (cmd == "skills"  || cmd == "skill")         { HandleSkills(args);    return true; }
+    if (cmd == "memory"  || cmd == "mem")           { HandleMemory(args);    return true; }
 
     utils::PrintWarning("未知命令: /" + cmd + "。输入 /help 查看帮助。");
     return true;
@@ -190,6 +245,11 @@ void Repl::HandleHelp() {
               << utils::color::kYellow << "目录\n" << utils::color::kReset
               << "  /cd <路径>       切换工作目录\n"
               << "  /pwd             显示当前工作目录\n\n"
+              << utils::color::kYellow << "项目记忆\n" << utils::color::kReset
+              << "  /memory              显示当前 TERMIND.md 内容\n"
+              << "  /memory init         在当前目录创建 TERMIND.md 模板\n"
+              << "  /memory edit         用 $EDITOR 打开 TERMIND.md\n"
+              << "  /memory reload       重新加载 TERMIND.md\n\n"
               << utils::color::kYellow << "Skills\n" << utils::color::kReset
               << "  /skills              列出所有可用 Skills\n"
               << "  /skills load <name>  手动加载 Skill 到上下文\n"
@@ -310,7 +370,19 @@ void Repl::HandleCd(const std::string& args) {
     context_.SetWorkingDir(new_dir);
     // 重新注册内置工具（Register 会覆盖同名工具，从而更新工作目录绑定）
     RegisterBuiltinTools(ToolRegistry::GetInstance(), new_dir.string());
-    utils::PrintSuccess("工作目录: " + new_dir.string());
+
+    // 重新加载新工作目录的项目记忆
+    bool had_memory = !project_memory_path_.empty();
+    InitProjectMemory();
+    bool has_memory = !project_memory_path_.empty();
+
+    std::string msg = "工作目录: " + new_dir.string();
+    if (has_memory) {
+        msg += "\n  📋 已加载项目记忆: " + project_memory_path_.string();
+    } else if (had_memory) {
+        msg += "\n  📋 项目记忆已卸载（当前目录无 TERMIND.md）";
+    }
+    utils::PrintSuccess(msg);
 }
 
 void Repl::HandlePwd() {
@@ -418,6 +490,144 @@ void Repl::HandleSkills(const std::string& args) {
     std::cout << utils::color::kDim
               << "  /skills load <name>  — 手动加载 Skill 到上下文\n"
               << "  /skills reload       — 重新扫描目录\n"
+              << utils::color::kReset << "\n";
+}
+
+// ── 项目记忆命令 ──────────────────────────────────────────────────────────
+
+// TERMIND.md 新建模板
+static const char* kMemoryTemplate = R"(# 项目记忆
+
+<!-- Termind 每次启动时自动加载此文件，向 AI 提供持久化的项目背景知识 -->
+
+## 项目简介
+
+<!-- 项目目的、技术栈、主要功能 -->
+
+## 构建与运行
+
+```bash
+# 构建命令
+# make -j$(nproc)
+
+# 运行命令
+# ./build/myapp
+```
+
+## 代码规范
+
+<!-- 编码风格、命名约定、注意事项 -->
+
+## 架构说明
+
+<!-- 主要模块及职责 -->
+
+## 常用路径
+
+<!-- 关键文件、配置文件位置 -->
+
+## 注意事项
+
+<!-- 已知问题、需要避免的操作、特殊依赖 -->
+)";
+
+void Repl::HandleMemory(const std::string& args) {
+    // /memory reload  — 重新读取 TERMIND.md
+    if (args == "reload") {
+        InitProjectMemory();
+        if (project_memory_path_.empty()) {
+            utils::PrintWarning("未找到 TERMIND.md（已搜索工作目录及上级直到 Git 根）");
+        } else {
+            utils::PrintSuccess("已重新加载: " + project_memory_path_.string() +
+                                "（" + std::to_string(project_memory_content_.size()) +
+                                " 字符）");
+        }
+        return;
+    }
+
+    // /memory edit  — 用 $EDITOR 打开
+    if (args == "edit") {
+        fs::path target = project_memory_path_.empty()
+                              ? context_.GetWorkingDir() / "TERMIND.md"
+                              : project_memory_path_;
+
+        // 若文件不存在则写入模板
+        if (!fs::exists(target)) {
+            if (!utils::WriteFile(target, kMemoryTemplate)) {
+                utils::PrintError("创建文件失败: " + target.string());
+                return;
+            }
+            utils::PrintInfo("已创建模板: " + target.string());
+        }
+
+        std::string editor = utils::GetEnv("VISUAL");
+        if (editor.empty()) editor = utils::GetEnv("EDITOR");
+        if (editor.empty()) editor = "vi";
+
+        std::string cmd = editor + " " + utils::EscapeShellArg(target.string());
+        int ret = std::system(cmd.c_str());  // NOLINT(cert-env33-c)
+        (void)ret;
+
+        // 编辑完毕后自动 reload
+        InitProjectMemory();
+        utils::PrintSuccess("已重新加载: " + target.string());
+        return;
+    }
+
+    // /memory init  — 在当前工作目录创建模板（不打开编辑器）
+    if (args == "init") {
+        fs::path target = context_.GetWorkingDir() / "TERMIND.md";
+        if (fs::exists(target)) {
+            utils::PrintWarning("文件已存在: " + target.string() +
+                                "，使用 /memory edit 编辑");
+            return;
+        }
+        if (!utils::WriteFile(target, kMemoryTemplate)) {
+            utils::PrintError("创建失败: " + target.string());
+            return;
+        }
+        InitProjectMemory();
+        utils::PrintSuccess("已创建: " + target.string());
+        return;
+    }
+
+    // /memory  — 显示当前状态
+    if (project_memory_path_.empty()) {
+        std::cout << "\n" << utils::color::kYellow
+                  << "📋 未找到项目记忆（TERMIND.md）" << utils::color::kReset << "\n\n"
+                  << "  Termind 会从工作目录向上搜索 TERMIND.md，直到 Git 根目录。\n"
+                  << "  创建一个来为 AI 提供持久化的项目背景：\n\n"
+                  << utils::color::kDim
+                  << "    /memory init          在当前目录创建模板\n"
+                  << "    /memory edit          创建并用 $EDITOR 打开\n"
+                  << utils::color::kReset << "\n";
+        return;
+    }
+
+    // 显示已加载的内容
+    std::cout << "\n" << utils::color::kBold << utils::color::kGreen
+              << "📋 项目记忆" << utils::color::kReset << "\n"
+              << "  路径: " << utils::color::kDim
+              << project_memory_path_.string() << utils::color::kReset << "\n"
+              << "  大小: " << utils::color::kDim
+              << utils::FormatFileSize(project_memory_content_.size())
+              << utils::color::kReset << "\n\n";
+
+    // 显示前 40 行内容预览
+    auto lines = utils::Split(project_memory_content_, '\n');
+    int preview_lines = std::min(static_cast<int>(lines.size()), 40);
+    for (int i = 0; i < preview_lines; ++i) {
+        std::cout << utils::color::kDim << "  " << utils::color::kReset
+                  << lines[i] << "\n";
+    }
+    if (static_cast<int>(lines.size()) > preview_lines) {
+        std::cout << utils::color::kDim << "  … 共 " << lines.size()
+                  << " 行，使用 /memory edit 查看全部" << utils::color::kReset << "\n";
+    }
+
+    std::cout << "\n" << utils::color::kDim
+              << "  /memory edit    编辑\n"
+              << "  /memory reload  重新加载\n"
               << utils::color::kReset << "\n";
 }
 
@@ -758,6 +968,22 @@ void Repl::PrintWelcome() const {
 
     if (cfg.api_key.empty()) {
         utils::PrintWarning("未检测到 API Key！请设置 TERMIND_API_KEY 或 OPENAI_API_KEY 环境变量。");
+    }
+
+    // 显示项目记忆状态
+    if (!project_memory_path_.empty()) {
+        std::cout << "  " << utils::color::kGreen << "📋 项目记忆"
+                  << utils::color::kReset << ": "
+                  << utils::color::kDim
+                  << utils::GetRelativePath(project_memory_path_,
+                                            context_.GetWorkingDir())
+                  << utils::color::kReset
+                  << "  (" << utils::FormatFileSize(project_memory_content_.size())
+                  << ")\n";
+    } else {
+        std::cout << "  " << utils::color::kDim
+                  << "📋 未找到 TERMIND.md，使用 /memory init 创建项目记忆"
+                  << utils::color::kReset << "\n";
     }
 
     std::cout << utils::color::kDim

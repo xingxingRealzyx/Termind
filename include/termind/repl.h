@@ -24,6 +24,14 @@ private:
 
     // ── Skills 初始化 ─────────────────────────────────────────────────────
     void InitSkills();
+
+    // ── 项目记忆 ──────────────────────────────────────────────────────────
+    // 在工作目录（及上级直到 Git 根）查找 TERMIND.md 并加载
+    void InitProjectMemory();
+    // 从工作目录向上查找 TERMIND.md，返回找到的路径（失败返回空）
+    std::filesystem::path FindProjectMemoryPath() const;
+    // 重建 system message：base_system_prompt + skills 摘要 + 项目记忆
+    void RebuildSystemMessage();
     std::string ReadLine(const std::string& prompt);
 
     // ── 处理输入 ──────────────────────────────────────────────────────────
@@ -44,6 +52,7 @@ private:
     void HandleAdd(const std::string& args);
     void HandleTokens();
     void HandleSkills(const std::string& args);
+    void HandleMemory(const std::string& args);
 
     // ── AI 代理循环 ───────────────────────────────────────────────────────
     // 发送用户消息，循环处理工具调用，直到得到最终答复
@@ -73,6 +82,11 @@ private:
     std::unique_ptr<AiClient> ai_client_;
     ContextManager context_;
     bool running_ = true;
+
+    // system message 的各层内容（用于重建）
+    std::string base_system_prompt_;    // 来自 config 或默认值
+    std::string project_memory_content_; // TERMIND.md 正文
+    std::filesystem::path project_memory_path_; // TERMIND.md 路径（空=未找到）
 };
 
 }  // namespace termind
