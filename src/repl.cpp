@@ -1,5 +1,6 @@
 #include "termind/repl.h"
 #include "termind/config.h"
+#include "termind/skill_manager.h"
 #include "termind/utils.h"
 
 #include <algorithm>
@@ -32,6 +33,9 @@ Repl::Repl() : ai_client_(std::make_unique<AiClient>()) {
     RegisterBuiltinTools(ToolRegistry::GetInstance(),
                          context_.GetWorkingDir().string());
 
+    // ── 初始化 SkillManager ────────────────────────────────────────────
+    InitSkills();
+
     InitReadline();
 }
 
@@ -40,6 +44,35 @@ Repl::~Repl() {
     std::string hist_path =
         utils::ExpandHome("~/.config/termind/history");
     write_history(hist_path.c_str());
+}
+
+// ── Skills 初始化 ─────────────────────────────────────────────────────────
+
+void Repl::InitSkills() {
+    const auto& cfg = ConfigManager::GetInstance().config();
+    auto& sm = SkillManager::GetInstance();
+    sm.Clear();
+
+    // 扫描目录：
+    //   1. 配置文件中指定的路径
+    //   2. ~/.config/termind/skills/（全局）
+    //   3. <工作目录>/.termind/skills/（项目本地）
+    std::vector<fs::path> dirs;
+
+    for (const auto& d : cfg.skills_dirs) {
+        dirs.push_back(utils::ExpandHome(d));
+    }
+    dirs.push_back(utils::ExpandHome("~/.config/termind/skills"));
+    dirs.push_back(context_.GetWorkingDir() / ".termind" / "skills");
+
+    sm.LoadFromDirs(dirs);
+
+    // 若有可用 Skills，在 system message 后追加摘要块
+    if (sm.HasSkills()) {
+        std::string sys = context_.GetSystemMessage();
+        sys += "\n\n" + sm.GetSummaryBlock();
+        context_.SetSystemMessage(sys);
+    }
 }
 
 // ── readline 初始化 ───────────────────────────────────────────────────────
@@ -129,6 +162,7 @@ bool Repl::DispatchCommand(const std::string& cmd, const std::string& args) {
     if (cmd == "pwd")                               { HandlePwd();           return true; }
     if (cmd == "add"   || cmd == "a")               { HandleAdd(args);       return true; }
     if (cmd == "tokens")                            { HandleTokens();        return true; }
+    if (cmd == "skills"  || cmd == "skill")         { HandleSkills(args);    return true; }
 
     utils::PrintWarning("未知命令: /" + cmd + "。输入 /help 查看帮助。");
     return true;
@@ -156,6 +190,10 @@ void Repl::HandleHelp() {
               << utils::color::kYellow << "目录\n" << utils::color::kReset
               << "  /cd <路径>       切换工作目录\n"
               << "  /pwd             显示当前工作目录\n\n"
+              << utils::color::kYellow << "Skills\n" << utils::color::kReset
+              << "  /skills              列出所有可用 Skills\n"
+              << "  /skills load <name>  手动加载 Skill 到上下文\n"
+              << "  /skills reload       重新扫描 Skills 目录\n\n"
               << utils::color::kYellow << "其他\n" << utils::color::kReset
               << "  /help            显示此帮助\n"
               << "  /quit            退出\n\n";
@@ -318,6 +356,69 @@ void Repl::HandleTokens() {
         std::cout << "  用量:          [" << bar << "]  " << pct << "%\n";
     }
     std::cout << "\n";
+}
+
+void Repl::HandleSkills(const std::string& args) {
+    auto& sm = SkillManager::GetInstance();
+
+    // /skills reload  — 重新扫描目录
+    if (args == "reload") {
+        InitSkills();
+        utils::PrintSuccess("Skills 已重新加载，发现 " +
+                            std::to_string(sm.GetSkills().size()) + " 个");
+        return;
+    }
+
+    // /skills load <name>  — 手动加载一个 skill 到上下文
+    if (args.substr(0, 5) == "load ") {
+        std::string name = utils::Trim(args.substr(5));
+        auto body = sm.GetSkillBody(name);
+        if (!body) {
+            utils::PrintError("未找到 Skill: " + name);
+            return;
+        }
+        sm.MarkLoaded(name);
+        // 注入到对话上下文
+        context_.AddUserMessage("[Skill 已手动加载: " + name + "]\n\n" + *body);
+        context_.AddAssistantMessage("好的，我已加载 Skill「" + name + "」，将按其指导执行任务。");
+        utils::PrintSuccess("已加载 Skill: " + name);
+        return;
+    }
+
+    // /skills  — 列出所有 Skills
+    const auto& skills = sm.GetSkills();
+    if (skills.empty()) {
+        std::cout << utils::color::kYellow
+                  << "没有发现可用的 Skills。\n"
+                  << utils::color::kReset
+                  << "  放置位置（任一）：\n"
+                  << "    ~/.config/termind/skills/<skill-name>/SKILL.md\n"
+                  << "    <工作目录>/.termind/skills/<skill-name>/SKILL.md\n"
+                  << "  或在 config.json 中配置 skills_dirs\n\n";
+        return;
+    }
+
+    std::cout << "\n" << utils::color::kBold << utils::color::kCyan
+              << "可用 Skills (" << skills.size() << " 个)"
+              << utils::color::kReset << "\n\n";
+
+    for (const auto& s : skills) {
+        bool loaded = sm.IsLoaded(s.name);
+        std::cout << "  " << (loaded
+                              ? std::string(utils::color::kGreen) + "✅"
+                              : std::string(utils::color::kDim)   + "⬜")
+                  << utils::color::kReset << "  "
+                  << utils::color::kBold << s.name << utils::color::kReset << "\n"
+                  << "       " << utils::color::kDim << s.description
+                  << utils::color::kReset << "\n"
+                  << "       " << utils::color::kDim << s.dir.string()
+                  << utils::color::kReset << "\n\n";
+    }
+
+    std::cout << utils::color::kDim
+              << "  /skills load <name>  — 手动加载 Skill 到上下文\n"
+              << "  /skills reload       — 重新扫描目录\n"
+              << utils::color::kReset << "\n";
 }
 
 // ── AI 代理循环 ───────────────────────────────────────────────────────────

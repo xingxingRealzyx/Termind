@@ -1,4 +1,5 @@
 #include "termind/tool_registry.h"
+#include "termind/skill_manager.h"
 #include "termind/utils.h"
 
 #include <algorithm>
@@ -454,6 +455,115 @@ void RegisterBuiltinTools(ToolRegistry& registry,
             return {exit_code == 0, ss.str()};
         },
         true  // 需要确认
+    });
+
+    // ════════════════════════════════════════════════════════════════════
+    // list_skills  — 列出可用 Skills
+    // ════════════════════════════════════════════════════════════════════
+    registry.Register({
+        {
+            "list_skills",
+            "列出当前已发现的所有可用 Skills，包含每个 Skill 的名称和描述。"
+            "调用 load_skill 前可先用此工具查看可选项。",
+            {}  // 无参数
+        },
+        [](const nlohmann::json& /*args*/) -> ToolResult {
+            auto& sm = SkillManager::GetInstance();
+            const auto& skills = sm.GetSkills();
+
+            if (skills.empty()) {
+                return {true, "当前没有可用的 Skills。\n"
+                              "将 Skill 目录放到 ~/.config/termind/skills/ 或"
+                              " <工作目录>/.termind/skills/ 下，重启后自动加载。"};
+            }
+
+            std::ostringstream ss;
+            ss << "可用 Skills (" << skills.size() << " 个):\n\n";
+            for (const auto& s : skills) {
+                bool loaded = sm.IsLoaded(s.name);
+                ss << "  " << (loaded ? "✅" : "⬜") << " **" << s.name << "**\n"
+                   << "     " << s.description << "\n"
+                   << "     路径: " << s.dir.string() << "\n\n";
+            }
+            ss << "使用 load_skill 工具加载指定 Skill 的完整指导。";
+            return {true, ss.str()};
+        },
+        false
+    });
+
+    // ════════════════════════════════════════════════════════════════════
+    // load_skill  — 加载指定 Skill 的完整指导到上下文
+    // ════════════════════════════════════════════════════════════════════
+    registry.Register({
+        {
+            "load_skill",
+            "加载指定 Skill 的完整 SKILL.md 指导内容。"
+            "当用户请求与某个 Skill 相关时，调用此工具获取完整指导，然后再执行任务。"
+            "已加载的 Skill 再次调用会返回缓存内容。",
+            {
+                {"name", "string", "Skill 的名称（使用 list_skills 查看可用列表）", true},
+            }
+        },
+        [](const nlohmann::json& args) -> ToolResult {
+            std::string name = args.at("name").get<std::string>();
+            auto& sm = SkillManager::GetInstance();
+
+            const SkillMeta* meta = sm.FindSkill(name);
+            if (!meta) {
+                return {false, "未找到 Skill: " + name +
+                               "。使用 list_skills 查看可用列表。"};
+            }
+
+            auto body = sm.GetSkillBody(name);
+            if (!body) {
+                return {false, "无法读取 Skill 内容: " + name};
+            }
+
+            sm.MarkLoaded(name);
+
+            std::ostringstream ss;
+            ss << "# Skill 已加载: " << name << "\n\n"
+               << *body;
+            return {true, ss.str()};
+        },
+        false
+    });
+
+    // ════════════════════════════════════════════════════════════════════
+    // load_skill_file  — 加载 Skill 目录下的附属文件
+    // ════════════════════════════════════════════════════════════════════
+    registry.Register({
+        {
+            "load_skill_file",
+            "加载指定 Skill 目录下的附属文件（如 scripts/、reference/ 下的文件）。"
+            "路径相对于 Skill 根目录。",
+            {
+                {"skill_name", "string", "Skill 名称",                         true},
+                {"file_path",  "string", "相对于 Skill 根目录的文件路径", true},
+            }
+        },
+        [](const nlohmann::json& args) -> ToolResult {
+            std::string skill_name = args.at("skill_name").get<std::string>();
+            std::string file_path  = args.at("file_path").get<std::string>();
+
+            auto& sm = SkillManager::GetInstance();
+            const SkillMeta* meta = sm.FindSkill(skill_name);
+            if (!meta) {
+                return {false, "未找到 Skill: " + skill_name};
+            }
+
+            auto content = sm.GetSkillFile(skill_name, file_path);
+            if (!content) {
+                return {false, "无法读取文件: " + file_path +
+                               "（Skill: " + skill_name + "）"};
+            }
+
+            std::ostringstream ss;
+            ss << "# " << skill_name << " / " << file_path << "\n\n"
+               << *content;
+            return {true, ss.str()};
+        },
+        false
     });
 
     // ════════════════════════════════════════════════════════════════════

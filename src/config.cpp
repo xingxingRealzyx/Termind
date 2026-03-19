@@ -66,6 +66,14 @@ bool ConfigManager::LoadFromFile(const std::string& path) {
         get_str("system_prompt",       config_.system_prompt);
         get_int("max_context_tokens",  config_.max_context_tokens);
 
+        if (j.contains("skills_dirs") && j["skills_dirs"].is_array()) {
+            config_.skills_dirs.clear();
+            for (const auto& item : j["skills_dirs"]) {
+                if (item.is_string())
+                    config_.skills_dirs.push_back(item.get<std::string>());
+            }
+        }
+
         return true;
     } catch (const std::exception& e) {
         std::cerr << utils::color::kRed << "配置文件解析失败: "
@@ -119,6 +127,7 @@ bool ConfigManager::SaveToFile(const std::string& path) const {
     j["max_tool_iterations"] = config_.max_tool_iterations;
     j["system_prompt"]       = config_.system_prompt;
     j["max_context_tokens"]  = config_.max_context_tokens;
+    j["skills_dirs"]         = config_.skills_dirs;
 
     std::ofstream f(config_path);
     if (!f.is_open()) return false;

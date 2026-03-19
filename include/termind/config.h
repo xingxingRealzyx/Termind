@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace termind {
 
@@ -25,6 +26,10 @@ struct Config {
 
     // 系统提示词（可由配置文件覆盖）
     std::string system_prompt;
+
+    // Skills 扫描目录列表（空时使用默认路径 ~/.config/termind/skills）
+    // 每项可以是绝对路径或 ~ 开头的路径
+    std::vector<std::string> skills_dirs;
 };
 
 // ── 配置管理器（单例）──────────────────────────────────────────────────────

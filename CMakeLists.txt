@@ -36,6 +36,7 @@ set(SOURCES
     src/main.cpp
     src/config.cpp
     src/utils.cpp
+    src/skill_manager.cpp
     src/tool_registry.cpp
     src/ai_client.cpp
     src/context_manager.cpp

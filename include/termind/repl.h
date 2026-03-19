@@ -21,6 +21,9 @@ public:
 private:
     // ── 输入 ──────────────────────────────────────────────────────────────
     void InitReadline();
+
+    // ── Skills 初始化 ─────────────────────────────────────────────────────
+    void InitSkills();
     std::string ReadLine(const std::string& prompt);
 
     // ── 处理输入 ──────────────────────────────────────────────────────────
@@ -40,6 +43,7 @@ private:
     void HandlePwd();
     void HandleAdd(const std::string& args);
     void HandleTokens();
+    void HandleSkills(const std::string& args);
 
     // ── AI 代理循环 ───────────────────────────────────────────────────────
     // 发送用户消息，循环处理工具调用，直到得到最终答复
