@@ -124,8 +124,7 @@ size_t AiClient::StreamWriteCallback(char* ptr, size_t size, size_t nmemb,
             if (data == "[DONE]") {
                 ctx->finished = true;
                 buf.erase(0, pos);
-                // 返回 0 让 curl 结束
-                return 0;
+                return size * nmemb;  // 必须返回实际处理字节数，否则 curl 会认为错误并中止
             }
             try {
                 auto chunk = nlohmann::json::parse(data);

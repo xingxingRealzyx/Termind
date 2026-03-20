@@ -586,6 +586,15 @@ void RegisterBuiltinTools(ToolRegistry& registry,
         [wd](const nlohmann::json& args) -> ToolResult {
             std::string command = args.at("command").get<std::string>();
 
+            // 危险命令黑名单（防止命令注入或误操作）
+            static const std::vector<std::string> kDangerousPatterns = {
+                "rm -rf /", "rm -rf /*", "mkfs ", "dd if=",
+            };
+            for (const auto& pat : kDangerousPatterns) {
+                if (command.find(pat) != std::string::npos)
+                    return {false, "拒绝执行：命令包含危险模式 \"" + pat + "\""};
+            }
+
             std::string full_cmd = "cd " + utils::EscapeShellArg(wd.string()) +
                                    " && " + command + " 2>&1";
 
