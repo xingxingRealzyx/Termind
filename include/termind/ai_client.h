@@ -91,6 +91,7 @@ private:
     struct StreamContext {
         std::string buffer;
         std::string accumulated_content;
+        std::string error_body;          // 捕获非 SSE 格式的错误响应体
         std::vector<PartialToolCall> tool_calls;
         std::string finish_reason;
         bool finished = false;

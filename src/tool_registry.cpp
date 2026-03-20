@@ -3,13 +3,17 @@
 #include "termind/utils.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <regex>
 #include <sstream>
 #include <iostream>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 namespace termind {
 
@@ -158,10 +162,23 @@ void RegisterBuiltinTools(ToolRegistry& registry,
                 return {true, ss.str()};
             }
 
+            // 统计行数
+            int total_lines = 0;
+            for (char c : *content) if (c == '\n') ++total_lines;
+            if (!content->empty() && content->back() != '\n') ++total_lines;
+
             std::ostringstream ss;
             ss << "文件: " << path_str << "  ("
-               << utils::FormatFileSize(content->size()) << ")\n---\n"
+               << utils::FormatFileSize(content->size())
+               << "，共 " << total_lines << " 行)\n---\n"
                << *content;
+
+            // 大文件无 offset：附加提示，引导下次先用 get_file_outline
+            if (total_lines > 200) {
+                ss << "\n---\n[提示：此文件共 " << total_lines
+                   << " 行，下次阅读前建议先调用 get_file_outline 获取结构摘要，"
+                   "再用 start_line/end_line 精确读取目标片段以节省上下文]";
+            }
             return {true, ss.str()};
         },
         false  // 读操作无需确认
@@ -418,6 +435,144 @@ void RegisterBuiltinTools(ToolRegistry& registry,
     });
 
     // ════════════════════════════════════════════════════════════════════
+    // search_symbol  — 智能符号搜索（函数/类/变量定义及用法）
+    // ════════════════════════════════════════════════════════════════════
+    registry.Register({
+        {
+            "search_symbol",
+            "在代码库中搜索函数、类、结构体、变量的定义或使用位置。"
+            "比 grep_code 更智能：会针对定义模式构造搜索，适合"
+            "\"函数在哪里定义\"、\"类在哪里声明\" 等场景。",
+            {
+                {"symbol",     "string", "要搜索的符号名（函数名、类名、变量名等）", true},
+                {"search_type","string",
+                 "搜索类型：\"definition\"（仅定义）、\"usage\"（仅用法）、"
+                 "\"all\"（全部，默认）", false},
+                {"file_glob",  "string", "限定文件范围，如 \"*.cpp\" 或 \"*.py\"", false},
+                {"path",       "string", "搜索根目录，默认为工作目录", false},
+            }
+        },
+        [wd](const nlohmann::json& args) -> ToolResult {
+            std::string symbol      = args.at("symbol").get<std::string>();
+            std::string search_type = args.value("search_type", "all");
+            std::string file_glob   = args.value("file_glob", "");
+            std::string path_str    = args.value("path", ".");
+            fs::path search_path    = ResolvePath(path_str, wd);
+
+            // 转义符号中的特殊正则字符
+            std::string esc_sym;
+            for (char c : symbol) {
+                if (std::string(".[*+?^${}()|\\").find(c) != std::string::npos)
+                    esc_sym += '\\';
+                esc_sym += c;
+            }
+
+            // 按语言类型和搜索类型构造不同的正则模式
+            std::vector<std::string> patterns;
+
+            if (search_type == "definition" || search_type == "all") {
+                // C/C++：函数定义/声明
+                patterns.push_back(
+                    "(^|\\s)(void|int|bool|auto|char|float|double|long|short|"
+                    "unsigned|static|inline|virtual|explicit|constexpr|std::\\w+|\\w+)\\s+"
+                    + esc_sym + "\\s*\\(");
+                // C/C++：类/结构体/枚举定义
+                patterns.push_back(
+                    "\\b(class|struct|enum|union|typedef)\\b[\\s\\w]*\\b"
+                    + esc_sym + "\\b");
+                // Python：函数/类定义
+                patterns.push_back("^\\s*(def|class|async def)\\s+" + esc_sym + "\\b");
+                // Go/Rust/Java/JS：函数/类/接口定义
+                patterns.push_back(
+                    "\\b(func|fn|function|def|class|interface|trait|type)\\s+"
+                    + esc_sym + "\\b");
+                // 变量/常量定义（通用）
+                patterns.push_back(
+                    "\\b(const|let|var|val|static|extern)\\s+[\\w<>*&:\\s]*\\b"
+                    + esc_sym + "\\b");
+            }
+
+            if (search_type == "usage" || search_type == "all") {
+                // 任何包含符号的行（用法）
+                patterns.push_back("\\b" + esc_sym + "\\b");
+            }
+
+            // 若 all 模式，先用精确定义模式搜，结果少则再搜 usage
+            std::string result;
+            std::string include_arg = file_glob.empty()
+                ? "" : " --include=" + utils::EscapeShellArg(file_glob);
+
+            if (search_type == "all") {
+                // 先只搜定义，输出数量少、更有价值
+                std::string def_pattern = "(^|\\s)(" 
+                    "void|int|bool|auto|char|float|double|long|unsigned|"
+                    "static|inline|virtual|std::\\w+|\\w+)\\s+" + esc_sym + "\\s*\\("
+                    "|\\b(class|struct|enum|union|typedef)\\b[\\s\\w]*\\b" + esc_sym + "\\b"
+                    "|^\\s*(def|class|async def|func|fn|function|interface|trait)\\s+" + esc_sym + "\\b";
+
+                std::string cmd = "grep -rn -E "
+                    + utils::EscapeShellArg(def_pattern)
+                    + include_arg
+                    + " " + utils::EscapeShellArg(search_path.string())
+                    + " 2>/dev/null | head -50";
+
+                FILE* p = popen(cmd.c_str(), "r");
+                if (p) {
+                    char buf[512];
+                    while (fgets(buf, sizeof(buf), p)) result += buf;
+                    pclose(p);
+                }
+
+                // 如果定义结果足够，直接返回
+                if (!result.empty()) {
+                    return {true, "符号 '" + symbol + "' 的定义位置:\n" + result};
+                }
+
+                // 没有定义，退而求其次搜用法
+                std::string use_cmd = "grep -rn -E "
+                    + utils::EscapeShellArg("\\b" + esc_sym + "\\b")
+                    + include_arg
+                    + " " + utils::EscapeShellArg(search_path.string())
+                    + " 2>/dev/null | head -50";
+
+                FILE* p2 = popen(use_cmd.c_str(), "r");
+                if (p2) {
+                    char buf[512];
+                    while (fgets(buf, sizeof(buf), p2)) result += buf;
+                    pclose(p2);
+                }
+
+                if (result.empty())
+                    return {true, "未找到符号 '" + symbol + "' 的定义或用法"};
+                return {true, "未找到 '" + symbol + "' 的定义，以下是使用位置:\n" + result};
+            }
+
+            // 非 all 模式：用对应模式列表逐一搜索
+            for (const auto& pat : patterns) {
+                std::string cmd = "grep -rn -E "
+                    + utils::EscapeShellArg(pat)
+                    + include_arg
+                    + " " + utils::EscapeShellArg(search_path.string())
+                    + " 2>/dev/null | head -80";
+                FILE* p = popen(cmd.c_str(), "r");
+                if (p) {
+                    char buf[512];
+                    while (fgets(buf, sizeof(buf), p)) result += buf;
+                    pclose(p);
+                }
+                if (!result.empty()) break;
+            }
+
+            if (result.empty())
+                return {true, "未找到符号 '" + symbol + "'"};
+
+            std::string label = (search_type == "definition") ? "定义" : "用法";
+            return {true, "符号 '" + symbol + "' 的" + label + ":\n" + result};
+        },
+        false
+    });
+
+    // ════════════════════════════════════════════════════════════════════
     // run_shell  — 执行 shell 命令（需要确认）
     // ════════════════════════════════════════════════════════════════════
     registry.Register({
@@ -437,22 +592,119 @@ void RegisterBuiltinTools(ToolRegistry& registry,
             FILE* pipe = popen(full_cmd.c_str(), "r");
             if (!pipe) return {false, "无法启动命令"};
 
+            // 截断命令标题（太长时省略中间部分）
+            auto make_heading = [](const std::string& cmd) -> std::string {
+                constexpr size_t kMaxLen = 60;
+                std::string disp = cmd;
+                if (disp.size() > kMaxLen)
+                    disp = disp.substr(0, kMaxLen / 2) + " … " +
+                           disp.substr(disp.size() - kMaxLen / 2);
+                return std::string(utils::color::kYellow) + "⚡ " +
+                       utils::color::kReset +
+                       utils::color::kDim + "$ " + disp +
+                       utils::color::kReset;
+            };
+
+            utils::ThinkingPane pane;
+            pane.Start(make_heading(command));
+
+            // 用 poll() + 非阻塞读替代阻塞 fgets，解决后台进程（&）占住管道
+            // 导致永久阻塞的问题
+            int fd = fileno(pipe);
+            fcntl(fd, F_SETFL, O_NONBLOCK);
+
+            // 空闲超时：连续 30 秒无新输出时停止等待（处理 & 后台进程）
+            // 硬性超时：总计 120 秒（兜底）
+            constexpr int kIdleSecs = 30;
+            constexpr int kHardSecs = 120;
+
+            auto wall_start = std::chrono::steady_clock::now();
+            auto last_data  = wall_start;
+
             std::string output;
-            char buf[512];
-            while (fgets(buf, sizeof(buf), pipe)) {
-                output += buf;
-                if (output.size() > 100000) {
-                    output += "\n... (输出已截断) ...\n";
+            bool truncated  = false;
+            bool timed_out  = false;
+            char buf[4096];
+
+            while (true) {
+                auto now       = std::chrono::steady_clock::now();
+                auto wall_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                     now - wall_start).count();
+                auto idle_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                     now - last_data).count();
+
+                if (wall_secs >= kHardSecs) {
+                    output += "\n[硬性超时：命令运行超过 " +
+                              std::to_string(kHardSecs) + " 秒，已停止等待]\n";
+                    timed_out = true;
                     break;
                 }
+
+                struct pollfd pfd{fd, POLLIN, 0};
+                int ret = poll(&pfd, 1, 200);  // 每 200ms 轮询一次
+
+                if (ret < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+
+                if (ret == 0) {
+                    // 200ms 内无数据
+                    if (!output.empty() && idle_secs >= kIdleSecs) {
+                        // 已有输出，但超过空闲阈值 → 后台进程占管道，退出等待
+                        output += "\n[空闲超时：" + std::to_string(kIdleSecs) +
+                                  " 秒无新输出，已停止等待（后台进程可能仍在运行）]\n";
+                        timed_out = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                // 有事件
+                if (pfd.revents & (POLLHUP | POLLERR)) {
+                    // 管道关闭，排干剩余数据
+                    while (true) {
+                        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                        if (n <= 0) break;
+                        buf[n] = '\0';
+                        std::string chunk(buf, static_cast<size_t>(n));
+                        pane.FeedRaw(chunk);
+                        output += chunk;
+                    }
+                    break;
+                }
+
+                if (pfd.revents & POLLIN) {
+                    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                    if (n < 0 && errno == EAGAIN) continue;
+                    if (n <= 0) break;  // EOF
+                    buf[n] = '\0';
+                    last_data = now;
+                    std::string chunk(buf, static_cast<size_t>(n));
+                    pane.FeedRaw(chunk);
+                    output += chunk;
+                    if (output.size() > 100000) {
+                        output += "\n... (输出已截断) ...\n";
+                        truncated = true;
+                        break;
+                    }
+                }
             }
+
+            // pclose 等待 shell 子进程退出；若子进程已退出则立即返回
             int status = pclose(pipe);
-            int exit_code = WEXITSTATUS(status);
+            pane.Stop();
+
+            int exit_code = (WIFEXITED(status) && !timed_out)
+                                ? WEXITSTATUS(status) : -1;
 
             std::ostringstream ss;
-            ss << "$ " << command << "\n" << output
-               << "\n[退出码: " << exit_code << "]";
-            return {exit_code == 0, ss.str()};
+            ss << "$ " << command << "\n" << output;
+            if (truncated || timed_out)
+                ss << "\n[退出码: 未知]";
+            else
+                ss << "\n[退出码: " << exit_code << "]";
+            return {(!timed_out && !truncated && exit_code == 0), ss.str()};
         },
         true  // 需要确认
     });
@@ -567,6 +819,147 @@ void RegisterBuiltinTools(ToolRegistry& registry,
     });
 
     // ════════════════════════════════════════════════════════════════════
+    // get_file_outline  — 文件结构摘要（类/函数/行号）
+    // ════════════════════════════════════════════════════════════════════
+    registry.Register({
+        {
+            "get_file_outline",
+            "获取源代码文件的结构摘要：列出所有类、函数、方法及其行号。"
+            "建议在阅读超过 200 行的文件前先调用此工具，"
+            "再用 read_file 的 start_line/end_line 精确读取目标片段，避免一次性读入整个大文件。",
+            {
+                {"path", "string", "文件路径（绝对或相对工作目录）", true},
+            }
+        },
+        [wd](const nlohmann::json& args) -> ToolResult {
+            std::string path_str = args.at("path").get<std::string>();
+            fs::path path = ResolvePath(path_str, wd);
+
+            if (!fs::exists(path))
+                return {false, "文件不存在: " + path_str};
+            if (fs::is_directory(path))
+                return {false, "路径是目录，请使用 list_directory"};
+
+            // 统计总行数
+            int total_lines = 0;
+            {
+                auto c = utils::ReadFile(path);
+                if (c) {
+                    for (char ch : *c) if (ch == '\n') ++total_lines;
+                    if (!c->empty() && c->back() != '\n') ++total_lines;
+                }
+            }
+
+            std::string outline;
+            outline += "文件: " + path_str + "  共 " +
+                       std::to_string(total_lines) + " 行\n";
+            outline += std::string(50, '-') + "\n";
+
+            // ── 方案 A：ctags（精准，需要系统安装 universal-ctags 或 exuberant-ctags）
+            bool used_ctags = false;
+            {
+                // 过滤掉太细粒度的 kind（member/variable/enumerator/macro）
+                static const std::string kSkipKinds =
+                    "member variable enumerator macro local externvar";
+
+                std::string cmd = "ctags -x --sort=no "
+                    + utils::EscapeShellArg(path.string()) + " 2>/dev/null";
+                FILE* p = popen(cmd.c_str(), "r");
+                if (p) {
+                    std::string raw;
+                    char buf[1024];
+                    while (fgets(buf, sizeof(buf), p)) raw += buf;
+                    pclose(p);
+
+                    if (!raw.empty()) {
+                        std::istringstream ss(raw);
+                        std::string line;
+                        int count = 0;
+                        while (std::getline(ss, line) && count < 300) {
+                            std::istringstream ls(line);
+                            std::string name, kind, lineno, file;
+                            ls >> name >> kind >> lineno >> file;
+                            if (name.empty() || lineno.empty()) continue;
+                            if (kSkipKinds.find(kind) != std::string::npos) continue;
+
+                            // pattern（源码片段）
+                            std::string pat;
+                            std::getline(ls, pat);
+                            size_t ps = pat.find_first_not_of(" \t");
+                            if (ps != std::string::npos) pat = pat.substr(ps);
+                            if (pat.size() > 72) pat = pat.substr(0, 72) + "…";
+
+                            // 格式：L 行号  kind  name  — pattern
+                            std::string lpad(5 - std::min<size_t>(5, lineno.size()), ' ');
+                            outline += "  L" + lpad + lineno
+                                    + "  " + kind
+                                    + std::string(std::max<int>(1, 12 - (int)kind.size()), ' ')
+                                    + name;
+                            if (!pat.empty()) outline += "  —  " + pat;
+                            outline += "\n";
+                            ++count;
+                        }
+                        if (count > 0) used_ctags = true;
+                    }
+                }
+            }
+
+            // ── 方案 B：grep 语言特定正则（ctags 不可用时的退路）
+            if (!used_ctags) {
+                std::string ext = path.extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+                // 语言→grep 正则（捕获函数/类/方法定义行）
+                std::string pattern;
+                if (ext == ".cpp" || ext == ".cxx" || ext == ".cc" ||
+                    ext == ".c"   || ext == ".h"   || ext == ".hpp") {
+                    pattern = "^(class|struct|enum|union)\\s+\\w"
+                              "|^[a-zA-Z_][a-zA-Z0-9_:<>*& ]+[a-zA-Z_][a-zA-Z0-9_]*\\s*\\([^;{]*$";
+                } else if (ext == ".py") {
+                    pattern = "^\\s*(def|class|async def)\\s+\\w";
+                } else if (ext == ".go") {
+                    pattern = "^(func|type)\\s+";
+                } else if (ext == ".rs") {
+                    pattern = "^(pub\\s+)?(fn|struct|impl|trait|enum|type)\\s+";
+                } else if (ext == ".java") {
+                    pattern = "^\\s*(public|private|protected|static|void|class|interface|enum)";
+                } else if (ext == ".js" || ext == ".ts" || ext == ".tsx") {
+                    pattern = "^(export\\s+)?(function|class|const\\s+\\w+\\s*=\\s*(async\\s+)?function|interface|type)\\s+";
+                } else {
+                    // 通用：行首非空白、包含括号或冒号
+                    pattern = "^[a-zA-Z_].*[(:{}]\\s*$";
+                }
+
+                if (!pattern.empty()) {
+                    std::string cmd = "grep -nE " + utils::EscapeShellArg(pattern) +
+                                      " " + utils::EscapeShellArg(path.string()) +
+                                      " 2>/dev/null | head -200";
+                    FILE* p = popen(cmd.c_str(), "r");
+                    if (p) {
+                        char buf[512];
+                        while (fgets(buf, sizeof(buf), p)) {
+                            std::string row(buf);
+                            // 去尾换行
+                            while (!row.empty() && (row.back() == '\n' || row.back() == '\r'))
+                                row.pop_back();
+                            // row 格式："行号:源码"，截短过长行
+                            if (row.size() > 100) row = row.substr(0, 100) + "…";
+                            outline += "  " + row + "\n";
+                        }
+                        pclose(p);
+                        outline += "\n（来源：grep 退路，建议安装 ctags 以获取更精准的结构）";
+                    }
+                }
+            }
+
+            if (outline.find('\n', 60) == std::string::npos)
+                outline += "\n（未找到可识别的结构，请直接使用 read_file 阅读）";
+
+            return {true, outline};
+        },
+        false
+    });
+
     // get_file_info  — 文件元数据
     // ════════════════════════════════════════════════════════════════════
     registry.Register({

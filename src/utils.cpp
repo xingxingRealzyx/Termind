@@ -11,14 +11,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-namespace {
-// Braille 旋转动画帧（10 帧）
-constexpr const char* kSpinnerFrames[] = {
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
-};
-constexpr int kNumFrames = 10;
-constexpr int kFrameMs   = 80;
-}  // namespace
 
 namespace termind {
 namespace utils {
@@ -144,6 +136,14 @@ int GetTerminalWidth() {
     return 80;
 }
 
+int GetTerminalHeight() {
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_row > 0) {
+        return static_cast<int>(w.ws_row);
+    }
+    return 24;
+}
+
 bool IsAtty() {
     return isatty(STDOUT_FILENO) != 0;
 }
@@ -210,20 +210,41 @@ void PrintColoredDiff(const std::string& diff_text) {
 std::string ComputeDiff(const std::string& old_content,
                          const std::string& new_content,
                          const std::string& filename) {
-    // 写入临时文件
     char old_tmp[] = "/tmp/termind_old_XXXXXX";
     char new_tmp[] = "/tmp/termind_new_XXXXXX";
 
     int old_fd = mkstemp(old_tmp);
-    int new_fd = mkstemp(new_tmp);
-    if (old_fd < 0 || new_fd < 0) return "(diff 不可用)";
+    if (old_fd < 0) return "(diff 不可用)";
 
-    if (write(old_fd, old_content.data(),
-              static_cast<ssize_t>(old_content.size())) < 0) {}
-    if (write(new_fd, new_content.data(),
-              static_cast<ssize_t>(new_content.size())) < 0) {}
-    close(old_fd);
-    close(new_fd);
+    // RAII：确保临时文件在任何退出路径都被删除
+    struct TmpGuard {
+        char* path;
+        int   fd;
+        ~TmpGuard() {
+            if (fd >= 0) close(fd);
+            unlink(path);
+        }
+    } old_g{old_tmp, old_fd}, new_g{new_tmp, -1};
+
+    int new_fd = mkstemp(new_tmp);
+    if (new_fd < 0) return "(diff 不可用)";
+    new_g.fd = new_fd;
+
+    auto write_all = [](int fd, const std::string& data) -> bool {
+        size_t written = 0;
+        while (written < data.size()) {
+            ssize_t n = write(fd, data.data() + written, data.size() - written);
+            if (n < 0) return false;
+            written += static_cast<size_t>(n);
+        }
+        return true;
+    };
+
+    if (!write_all(old_fd, old_content) || !write_all(new_fd, new_content))
+        return "(diff 不可用)";
+
+    close(old_fd); old_g.fd = -1;
+    close(new_fd); new_g.fd = -1;
 
     std::string label_a = "a/" + filename;
     std::string label_b = "b/" + filename;
@@ -239,9 +260,6 @@ std::string ComputeDiff(const std::string& old_content,
         pclose(pipe);
     }
 
-    unlink(old_tmp);
-    unlink(new_tmp);
-
     return result.empty() ? "(无变化)" : result;
 }
 
@@ -250,14 +268,14 @@ std::string ComputeDiff(const std::string& old_content,
 char AskYesNoEdit(const std::string& prompt) {
     std::cout << color::kBrightYellow << "\n? " << color::kReset
               << prompt << " "
-              << color::kDim << "[y]es / [n]o / [e]dit" << color::kReset
+              << color::kDim << "[Y]es / [n]o / [e]dit" << color::kReset
               << "  ";
     std::cout.flush();
 
     std::string line;
-    if (!std::getline(std::cin, line)) return 'n';
+    if (!std::getline(std::cin, line)) return 'y';
     line = ToLower(Trim(line));
-    if (line.empty()) return 'n';
+    if (line.empty()) return 'y';
     return line[0];
 }
 
@@ -301,48 +319,165 @@ std::string ExpandHome(const std::string& path) {
     return GetEnv("HOME", "/tmp") + path.substr(1);
 }
 
-// ── Spinner ───────────────────────────────────────────────────────────────
+// ── TaskPanel ─────────────────────────────────────────────────────────────
 
-void Spinner::Start(const std::string& message) {
-    // 幂等：已在运行则先停止
-    if (running_.exchange(true)) return;
-    {
-        std::lock_guard<std::mutex> lock(message_mutex_);
-        message_ = message;
-    }
-    thread_ = std::thread([this] { ThreadFunc(); });
+void TaskPanel::SetTasks(const std::vector<std::string>& descs) {
+    tasks_.clear();
+    for (const auto& d : descs)
+        tasks_.push_back({d, Status::kPending});
+    rendered_lines_ = 0;
 }
 
-void Spinner::Stop() {
-    // 设为 false；如果之前已经是 false，直接返回（幂等）
-    if (!running_.exchange(false)) return;
-    if (thread_.joinable()) thread_.join();
-    // 清除整行（\r 回到行首，\033[2K 擦除整行）
-    std::cout << "\r\033[2K";
-    std::cout.flush();
-}
-
-void Spinner::SetMessage(const std::string& message) {
-    std::lock_guard<std::mutex> lock(message_mutex_);
-    message_ = message;
-}
-
-void Spinner::ThreadFunc() {
-    int frame = 0;
-    while (running_.load(std::memory_order_relaxed)) {
-        {
-            std::lock_guard<std::mutex> lock(message_mutex_);
-            std::cout << "\r"
-                      << color::kDim
-                      << kSpinnerFrames[frame % kNumFrames]
-                      << " " << message_
-                      << color::kReset
-                      << "   ";  // 尾部空格覆盖更长的旧文字
-            std::cout.flush();
+void TaskPanel::MarkDone(size_t idx) {
+    if (idx < tasks_.size())
+        tasks_[idx].status = Status::kDone;
+    // 激活下一个未开始的任务
+    for (size_t i = idx + 1; i < tasks_.size(); ++i) {
+        if (tasks_[i].status == Status::kPending) {
+            tasks_[i].status = Status::kActive;
+            break;
         }
-        ++frame;
-        std::this_thread::sleep_for(std::chrono::milliseconds(kFrameMs));
     }
+}
+
+void TaskPanel::ActivateFirst() {
+    for (auto& t : tasks_) {
+        if (t.status == Status::kPending) {
+            t.status = Status::kActive;
+            return;
+        }
+    }
+}
+
+void TaskPanel::AdvanceActive() {
+    // 找到当前 Active 任务 → 标为 Done
+    size_t active_idx = tasks_.size();
+    for (size_t i = 0; i < tasks_.size(); ++i) {
+        if (tasks_[i].status == Status::kActive) {
+            tasks_[i].status = Status::kDone;
+            active_idx = i;
+            break;
+        }
+    }
+    // 激活下一个 Pending 任务
+    for (size_t i = active_idx + 1; i < tasks_.size(); ++i) {
+        if (tasks_[i].status == Status::kPending) {
+            tasks_[i].status = Status::kActive;
+            break;
+        }
+    }
+}
+
+void TaskPanel::DoClear() {
+    if (rendered_lines_ == 0) return;
+    std::string out = "\033[" + std::to_string(rendered_lines_) + "A\033[J";
+    ::write(STDOUT_FILENO, out.data(), out.size());
+    rendered_lines_ = 0;
+}
+
+void TaskPanel::Clear() {
+    rendered_lines_ = 0;
+}
+
+void TaskPanel::Render() {
+    DoClear();
+
+    int done  = DoneCount();
+    int total = static_cast<int>(tasks_.size());
+    int tw    = std::max(40, GetTerminalWidth());
+
+    std::string out;
+    out.reserve(2048);
+
+    // ── 顶部边框 ──────────────────────────────────────────────────────────
+    std::string badge = " 执行计划 " + std::to_string(done) + "/" +
+                        std::to_string(total) + " ";
+    int inner = tw - 2;  // ╭ 和 ╮ 各占 1 列
+    int right = inner - 1 - static_cast<int>(badge.size());
+    if (right < 0) right = 0;
+
+    out += color::kDim;
+    out += "╭─";
+    out += color::kReset;
+    out += color::kBold;
+    out += badge;
+    out += color::kReset;
+    out += color::kDim;
+    out += Repeat("─", right);
+    out += "╮\n";
+    out += color::kReset;
+    int lines = 1;
+
+    // ── 任务行 ────────────────────────────────────────────────────────────
+    for (size_t i = 0; i < tasks_.size(); ++i) {
+        const auto& t = tasks_[i];
+
+        const char* icon   = nullptr;
+        const char* c_desc = nullptr;
+        const char* c_num  = color::kDim;
+        switch (t.status) {
+            case Status::kDone:
+                icon   = "✅"; c_desc = color::kDim;          break;
+            case Status::kActive:
+                icon   = "⏳"; c_desc = color::kBrightYellow; break;
+            default:
+                icon   = "⬜"; c_desc = color::kDim;          break;
+        }
+
+        std::string num  = std::to_string(i + 1) + ".";
+        // "│ " + icon(2字符宽) + " " + num + " " = 固定前缀
+        // icon 是 UTF-8 三字节但终端显示 2 列，所以不能用 size() 算宽度
+        // 保守估计前缀占 (3 + num.size() + 3) 列：│ [icon] [num] desc │
+        int prefix_cols = 3 + static_cast<int>(num.size()) + 2;
+        int max_desc    = tw - prefix_cols - 2;  // 留 2 列给右侧 " │"
+        if (max_desc < 8) max_desc = 8;
+
+        std::string desc = t.desc;
+        // 粗略截断（按字节，非完美但够用）
+        if (static_cast<int>(desc.size()) > max_desc)
+            desc = desc.substr(0, static_cast<size_t>(max_desc) - 1) + "…";
+
+        out += color::kDim;
+        out += "│ ";
+        out += color::kReset;
+        out += icon;
+        out += " ";
+        out += c_num;
+        out += num;
+        out += color::kReset;
+        out += " ";
+        out += c_desc;
+        out += desc;
+        out += color::kReset;
+        out += "\n";
+        ++lines;
+    }
+
+    // ── 底部边框 ──────────────────────────────────────────────────────────
+    out += color::kDim;
+    out += "╰";
+    out += Repeat("─", tw - 2);
+    out += "╯\n";
+    out += color::kReset;
+    ++lines;
+
+    rendered_lines_ = lines;
+    ::write(STDOUT_FILENO, out.data(), out.size());
+}
+
+
+bool TaskPanel::AllDone() const {
+    if (tasks_.empty()) return false;
+    for (const auto& t : tasks_)
+        if (t.status != Status::kDone) return false;
+    return true;
+}
+
+int TaskPanel::DoneCount() const {
+    int c = 0;
+    for (const auto& t : tasks_)
+        if (t.status == Status::kDone) ++c;
+    return c;
 }
 
 // ── ThinkingPane ──────────────────────────────────────────────────────────
@@ -361,6 +496,12 @@ void ThinkingPane::Start(const std::string& heading) {
         content_buf_.clear();
         rendered_lines_ = 0;
         frame_          = 0;
+        last_content_size_ = 0;
+    }
+    // 隐藏光标，避免光标在帧间跳动造成闪烁
+    if (isatty(STDOUT_FILENO)) {
+        static constexpr char kHide[] = "\033[?25l";
+        ::write(STDOUT_FILENO, kHide, sizeof(kHide) - 1);
     }
     thread_ = std::thread([this] { Loop(); });
 }
@@ -387,19 +528,42 @@ void ThinkingPane::Feed(const std::string& chunk) {
     }
 }
 
+void ThinkingPane::FeedRaw(const std::string& chunk) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (char c : chunk) {
+        if (c == '\r') continue;
+        content_buf_ += c;
+    }
+}
+
 void ThinkingPane::Stop() {
     if (!running_.exchange(false)) return;
     if (thread_.joinable()) thread_.join();
     // 后台线程已退出，可安全操作 stdout
-    std::lock_guard<std::mutex> lock(mutex_);
-    ClearLines();  // 单次 write 原子清除
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ClearLines();
+    }
+    // 恢复光标可见
+    if (isatty(STDOUT_FILENO)) {
+        static constexpr char kShow[] = "\033[?25h";
+        ::write(STDOUT_FILENO, kShow, sizeof(kShow) - 1);
+    }
 }
 
 void ThinkingPane::Loop() {
     while (running_.load(std::memory_order_relaxed)) {
         if (isatty(STDOUT_FILENO)) {
             std::lock_guard<std::mutex> lock(mutex_);
-            Render();  // 清除 + 重绘合并为单次 write，无中间空白帧
+            bool content_changed = (content_buf_.size() != last_content_size_);
+            last_content_size_ = content_buf_.size();
+            if (content_changed || rendered_lines_ == 0) {
+                // 有新内容：全量重绘
+                Render();
+            } else {
+                // 仅更新第一行 spinner，不擦除内容行，避免多余刷新
+                RenderSpinnerOnly();
+            }
         }
         ++frame_;
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -414,9 +578,42 @@ void ThinkingPane::ClearLines() {
     rendered_lines_ = 0;
 }
 
+void ThinkingPane::RenderSpinnerOnly() {
+    // 只刷新 spinner 行（第 1 行），内容行原地保留，避免整体擦屏引起的闪烁。
+    // 光标约定：Render() 结束后，光标在所有内容行的下一行行首。
+    // 本函数必须保持相同约定，否则下一次 Render() 的 \033[NA 会偏移。
+    if (rendered_lines_ == 0) { Render(); return; }
+
+    std::string out;
+    out.reserve(256);
+
+    // ① 上移到 spinner 行（行 1）
+    out += "\033[";
+    out += std::to_string(rendered_lines_);
+    out += "A";
+
+    // ② 擦除并重写 spinner（必须以 \n 结尾，让光标落在行 2 的行首）
+    out += "\r\033[2K";
+    out += color::kDim;
+    out += kPaneFrames[frame_ % kPaneNumFrames];
+    out += " ";
+    out += heading_;
+    out += color::kReset;
+    out += "\n";  // 光标现在在行 2 行首
+
+    // ③ 向下移到最后一行的下一行（行 rendered_lines_+1 行首）
+    //    已经在行 2，还需再下移 rendered_lines_-1 行
+    if (rendered_lines_ > 1) {
+        out += "\033[";
+        out += std::to_string(rendered_lines_ - 1);
+        out += "B";
+    }
+
+    ::write(STDOUT_FILENO, out.data(), out.size());
+}
+
 void ThinkingPane::Render() {
     // 将清除 + 新内容合并进一个 string，最后一次 ::write() 原子输出。
-    // 这样终端永远不会看到"清空后、新内容到达前"的中间空白帧，消除闪烁。
     std::string out;
     out.reserve(1024);
 

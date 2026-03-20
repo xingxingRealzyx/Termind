@@ -3,6 +3,7 @@
 #include "ai_client.h"
 #include "context_manager.h"
 #include "tool_registry.h"
+#include "utils.h"
 
 #include <memory>
 #include <string>
@@ -30,10 +31,14 @@ private:
     void InitProjectMemory();
     // 从工作目录向上查找 TERMIND.md，返回找到的路径（失败返回空）
     std::filesystem::path FindProjectMemoryPath() const;
-    // 重建 system message：base_system_prompt + skills 摘要 + 项目记忆
+    // 重建 system message：base_system_prompt + skills 摘要 + 项目记忆 + 构建信息
     void RebuildSystemMessage();
     // 注册 update_project_memory 工具（捕获 this，需在每次 InitProjectMemory 后调用）
     void RegisterMemoryTool();
+
+    // ── 构建系统探测 ──────────────────────────────────────────────────────
+    // 检测工作目录下的构建文件，返回可注入系统消息的描述字符串（空=未探测到）
+    std::string DetectBuildSystem() const;
     std::string ReadLine(const std::string& prompt);
 
     // ── 处理输入 ──────────────────────────────────────────────────────────
@@ -44,6 +49,7 @@ private:
     bool DispatchCommand(const std::string& cmd, const std::string& args);
     void HandleHelp();
     void HandleClear();
+    void HandlePlan(const std::string& args);
     void HandleFile(const std::string& args);
     void HandleFiles();
     void HandleClearFiles();
@@ -58,7 +64,9 @@ private:
 
     // ── AI 代理循环 ───────────────────────────────────────────────────────
     // 发送用户消息，循环处理工具调用，直到得到最终答复
-    void RunAgentLoop(const std::string& user_message);
+    // 若提供 panel，则在每轮迭代间渲染任务进度，并从 AI 输出中解析 [[DONE:N]] 标记
+    void RunAgentLoop(const std::string& user_message,
+                      utils::TaskPanel* panel = nullptr);
 
     // ── 工具执行（含确认流程）────────────────────────────────────────────
     ToolResult ExecuteToolWithConfirmation(const ToolCallRequest& tc);
@@ -83,12 +91,14 @@ private:
     // ── 状态 ──────────────────────────────────────────────────────────────
     std::unique_ptr<AiClient> ai_client_;
     ContextManager context_;
-    bool running_ = true;
+    bool running_        = true;
+    bool interrupt_loop_ = false;  // 用户在工具确认时选择中断整个任务
 
     // system message 的各层内容（用于重建）
-    std::string base_system_prompt_;    // 来自 config 或默认值
+    std::string base_system_prompt_;     // 来自 config 或默认值
     std::string project_memory_content_; // TERMIND.md 正文
     std::filesystem::path project_memory_path_; // TERMIND.md 路径（空=未找到）
+    std::string build_info_;             // 探测到的构建系统描述
 };
 
 }  // namespace termind

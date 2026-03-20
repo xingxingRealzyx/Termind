@@ -18,6 +18,42 @@ namespace termind {
 
 namespace fs = std::filesystem;
 
+// ── 项目记忆默认模板 ──────────────────────────────────────────────────────
+static const char* kMemoryTemplate = R"(# 项目记忆
+
+<!-- Termind 每次启动时自动加载此文件，向 AI 提供持久化的项目背景知识 -->
+
+## 项目简介
+
+<!-- 项目目的、技术栈、主要功能 -->
+
+## 构建与运行
+
+```bash
+# 构建命令
+# make -j$(nproc)
+
+# 运行命令
+# ./build/myapp
+```
+
+## 代码规范
+
+<!-- 编码风格、命名约定、注意事项 -->
+
+## 架构说明
+
+<!-- 主要模块及职责 -->
+
+## 常用路径
+
+<!-- 关键文件、配置文件位置 -->
+
+## 注意事项
+
+<!-- 已知问题、需要避免的操作、特殊依赖 -->
+)";
+
 // ── 构造 / 析构 ───────────────────────────────────────────────────────────
 
 Repl::Repl() : ai_client_(std::make_unique<AiClient>()) {
@@ -56,6 +92,11 @@ Repl::~Repl() {
 
 void Repl::RebuildSystemMessage() {
     std::string sys = base_system_prompt_;
+
+    // 追加构建系统信息
+    if (!build_info_.empty()) {
+        sys += build_info_;
+    }
 
     // 追加 Skills 摘要
     auto& sm = SkillManager::GetInstance();
@@ -107,21 +148,32 @@ void Repl::InitSkills() {
 // ── 项目记忆 ──────────────────────────────────────────────────────────────
 
 fs::path Repl::FindProjectMemoryPath() const {
-    // 从工作目录向上查找 TERMIND.md，直到找到 .git 根或文件系统根
-    fs::path dir = context_.GetWorkingDir();
+    fs::path cwd = context_.GetWorkingDir();
 
-    for (int depth = 0; depth < 10; ++depth) {
-        fs::path candidate = dir / "TERMIND.md";
-        if (fs::exists(candidate)) return candidate;
-
-        // 到达 git 根就停止（不再继续向上）
-        if (fs::exists(dir / ".git")) break;
-
-        fs::path parent = dir.parent_path();
-        if (parent == dir) break;  // 已到文件系统根
-        dir = parent;
+    // 第一步：向上找 git 根，确定搜索上界
+    fs::path git_root;
+    {
+        fs::path d = cwd;
+        for (int i = 0; i < 20; ++i) {
+            if (fs::exists(d / ".git")) { git_root = d; break; }
+            fs::path p = d.parent_path();
+            if (p == d) break;
+            d = p;
+        }
     }
-    return {};  // 未找到
+
+    // 第二步：在 [cwd, git_root] 范围内搜索 TERMIND.md
+    // 若没有 git 根，只看 cwd 本身（不向上走，避免误用其他项目的记忆）
+    fs::path d = cwd;
+    for (int i = 0; i < 20; ++i) {
+        if (fs::exists(d / "TERMIND.md")) return d / "TERMIND.md";
+        if (git_root.empty()) break;   // 无 git 根：只看 cwd
+        if (d == git_root) break;      // 已到 git 根，停止
+        fs::path p = d.parent_path();
+        if (p == d) break;
+        d = p;
+    }
+    return {};
 }
 
 void Repl::InitProjectMemory() {
@@ -133,10 +185,99 @@ void Repl::InitProjectMemory() {
         if (content) {
             project_memory_content_ = *content;
         }
+    } else {
+        // 首次启动，自动在 git 根（或当前目录）创建默认 TERMIND.md
+        fs::path create_dir = context_.GetWorkingDir();
+
+        // 向上找 git 根
+        fs::path d = create_dir;
+        for (int i = 0; i < 10; ++i) {
+            if (fs::exists(d / ".git")) { create_dir = d; break; }
+            fs::path p = d.parent_path();
+            if (p == d) break;
+            d = p;
+        }
+
+        fs::path target = create_dir / "TERMIND.md";
+        if (utils::WriteFile(target, kMemoryTemplate)) {
+            project_memory_path_    = target;
+            project_memory_content_ = kMemoryTemplate;
+            std::cout << utils::color::kDim
+                      << "  📋 已在 " << target.string()
+                      << " 创建 TERMIND.md\n"
+                      << utils::color::kReset;
+        }
     }
+
+    build_info_ = DetectBuildSystem();
 
     RebuildSystemMessage();
     RegisterMemoryTool();
+}
+
+// ── 构建系统探测 ──────────────────────────────────────────────────────────
+
+std::string Repl::DetectBuildSystem() const {
+    const fs::path& wd = context_.GetWorkingDir();
+
+    struct BuildSpec {
+        std::string marker;     // 检测文件名
+        std::string name;       // 构建系统名
+        std::string build_cmd;  // 默认构建命令
+        std::string test_cmd;   // 默认测试命令
+    };
+
+    // 按优先级排列；CMake 需特殊处理（区分有无 build 目录）
+    const std::vector<BuildSpec> specs = {
+        {"CMakeLists.txt", "CMake",  "",              ""},
+        {"Makefile",       "Make",   "make",           "make test"},
+        {"GNUmakefile",    "Make",   "make",           "make test"},
+        {"Cargo.toml",     "Cargo",  "cargo build",    "cargo test"},
+        {"package.json",   "npm",    "npm run build",  "npm test"},
+        {"pyproject.toml", "Python", "pip install -e .","pytest"},
+        {"setup.py",       "Python", "python setup.py build", "pytest"},
+        {"go.mod",         "Go",     "go build ./...", "go test ./..."},
+        {"build.gradle",   "Gradle", "./gradlew build","./gradlew test"},
+        {"pom.xml",        "Maven",  "mvn compile",    "mvn test"},
+        {"meson.build",    "Meson",  "meson compile -C build", "meson test -C build"},
+    };
+
+    for (const auto& spec : specs) {
+        if (!fs::exists(wd / spec.marker)) continue;
+
+        std::string build_cmd = spec.build_cmd;
+        std::string test_cmd  = spec.test_cmd;
+
+        // CMake：根据是否已有 build 目录给出不同命令
+        if (spec.name == "CMake") {
+            if (fs::exists(wd / "build" / "CMakeCache.txt")) {
+                build_cmd = "cmake --build build";
+                test_cmd  = "ctest --test-dir build";
+            } else if (fs::exists(wd / "build")) {
+                build_cmd = "cmake --build build";
+                test_cmd  = "ctest --test-dir build";
+            } else {
+                build_cmd = "cmake -B build && cmake --build build";
+                test_cmd  = "cmake -B build && cmake --build build && ctest --test-dir build";
+            }
+        }
+
+        // npm：优先用 yarn（若 yarn.lock 存在）
+        if (spec.name == "npm" && fs::exists(wd / "yarn.lock")) {
+            build_cmd = "yarn build";
+            test_cmd  = "yarn test";
+        }
+
+        std::ostringstream ss;
+        ss << "\n\n---\n## 当前项目构建信息（自动探测）\n\n"
+           << "- **构建系统**：" << spec.name << "（检测到 `" << spec.marker << "`）\n"
+           << "- **构建命令**：`" << build_cmd << "`\n";
+        if (!test_cmd.empty())
+            ss << "- **测试命令**：`" << test_cmd << "`\n";
+        ss << "\n验证代码修改后，请使用上述命令编译确认无误。";
+        return ss.str();
+    }
+    return "";
 }
 
 // ── update_project_memory 工具注册 ───────────────────────────────────────
@@ -386,6 +527,7 @@ bool Repl::DispatchCommand(const std::string& cmd, const std::string& args) {
     if (cmd == "tokens")                            { HandleTokens();        return true; }
     if (cmd == "skills"  || cmd == "skill")         { HandleSkills(args);    return true; }
     if (cmd == "memory"  || cmd == "mem")           { HandleMemory(args);    return true; }
+    if (cmd == "plan"    || cmd == "p")             { HandlePlan(args);      return true; }
 
     utils::PrintWarning("未知命令: /" + cmd + "。输入 /help 查看帮助。");
     return true;
@@ -422,6 +564,8 @@ void Repl::HandleHelp() {
               << "  /skills              列出所有可用 Skills\n"
               << "  /skills load <name>  手动加载 Skill 到上下文\n"
               << "  /skills reload       重新扫描 Skills 目录\n\n"
+              << utils::color::kYellow << "规划\n" << utils::color::kReset
+              << "  /plan <任务>     先输出执行计划，确认后再执行（别名: /p）\n\n"
               << utils::color::kYellow << "其他\n" << utils::color::kReset
               << "  /help            显示此帮助\n"
               << "  /quit            退出\n\n";
@@ -663,42 +807,6 @@ void Repl::HandleSkills(const std::string& args) {
 
 // ── 项目记忆命令 ──────────────────────────────────────────────────────────
 
-// TERMIND.md 新建模板
-static const char* kMemoryTemplate = R"(# 项目记忆
-
-<!-- Termind 每次启动时自动加载此文件，向 AI 提供持久化的项目背景知识 -->
-
-## 项目简介
-
-<!-- 项目目的、技术栈、主要功能 -->
-
-## 构建与运行
-
-```bash
-# 构建命令
-# make -j$(nproc)
-
-# 运行命令
-# ./build/myapp
-```
-
-## 代码规范
-
-<!-- 编码风格、命名约定、注意事项 -->
-
-## 架构说明
-
-<!-- 主要模块及职责 -->
-
-## 常用路径
-
-<!-- 关键文件、配置文件位置 -->
-
-## 注意事项
-
-<!-- 已知问题、需要避免的操作、特殊依赖 -->
-)";
-
 void Repl::HandleMemory(const std::string& args) {
     // /memory reload  — 重新读取 TERMIND.md
     if (args == "reload") {
@@ -799,9 +907,255 @@ void Repl::HandleMemory(const std::string& args) {
               << utils::color::kReset << "\n";
 }
 
+// ── 从规划文本中提取编号步骤 ─────────────────────────────────────────────
+
+static std::vector<std::string> ParseTasksFromPlanText(const std::string& text) {
+    std::vector<std::string> tasks;
+    for (const auto& line : utils::Split(text, '\n')) {
+        std::string s = utils::Trim(line);
+        if (s.empty()) continue;
+
+        // 匹配：数字 + '.' 或 ')' + 内容
+        // 如："1. 读取文件"、"2) **分析结构**：..."、"  3. 修改代码"
+        size_t i = 0;
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+        if (i == 0 || i >= s.size()) continue;
+        if (s[i] != '.' && s[i] != ')') continue;
+        ++i;
+        // 跳过空格和 markdown 粗体标记
+        while (i < s.size() && (s[i] == ' ' || s[i] == '*')) ++i;
+
+        std::string desc = s.substr(i);
+        // 去除末尾的 ** 和多余空格
+        while (!desc.empty() &&
+               (desc.back() == '*' || desc.back() == ' ' || desc.back() == ':'))
+            desc.pop_back();
+
+        if (desc.size() > 3)  // 过滤太短的（如纯标点）
+            tasks.push_back(desc);
+    }
+    return tasks;
+}
+
+// ── /plan 命令：先规划，再执行 ───────────────────────────────────────────
+
+void Repl::HandlePlan(const std::string& args) {
+    std::string task = utils::Trim(args);
+    if (task.empty()) {
+        utils::PrintWarning("用法: /plan <任务描述>\n"
+                            "  示例: /plan 给 User 类添加邮箱验证功能");
+        return;
+    }
+
+    utils::PrintHorizontalRule("规划模式");
+    std::cout << utils::color::kDim
+              << "  Termind 将先分析任务，输出执行计划，再询问是否开始。\n"
+              << utils::color::kReset << "\n";
+
+    // 构造规划专用的系统消息
+    auto messages = context_.GetMessages();
+    if (!messages.empty() && messages[0].role == MessageRole::kSystem) {
+        messages[0].content +=
+            "\n\n---\n## 当前模式：规划（Planning）\n\n"
+            "用户要求你先输出执行计划，**不要调用任何工具，不要修改任何代码**。\n"
+            "请在\"执行步骤\"部分使用严格的编号列表（1. 2. 3. ...），每步一行。\n"
+            "请按以下结构输出计划：\n"
+            "1. **任务理解**：用一句话概括要做什么\n"
+            "2. **需要了解的信息**：列出需要先阅读哪些文件或搜索哪些符号\n"
+            "3. **执行步骤**（编号列表，每步一行）：具体操作，注明使用什么工具\n"
+            "4. **潜在风险**：可能遇到的问题\n"
+            "5. **验证方案**：如何验证修改正确\n\n"
+            "输出计划后停止，不要执行任何操作。";
+    }
+    messages.push_back(Message::User("请为以下任务制定执行计划：\n\n" + task));
+
+    // ── 流式输出规划，同时累积完整文本 ──────────────────────────────────
+    std::cout << utils::color::kBrightGreen << "Termind"
+              << utils::color::kReset << " "
+              << utils::color::kDim << "❯ " << utils::color::kReset;
+
+    std::string plan_text;
+    bool first_chunk = true;
+    utils::ThinkingPane pane;
+    pane.Start("规划中…");
+
+    ai_client_->ChatStream(
+        messages, {},
+        [&](const std::string& chunk) {
+            if (first_chunk) { pane.Stop(); first_chunk = false; }
+            std::cout << chunk;
+            std::cout.flush();
+            plan_text += chunk;
+        });
+
+    pane.Stop();
+    std::cout << "\n\n";
+    utils::PrintHorizontalRule();
+
+    // ── 解析步骤，构建 TaskPanel ──────────────────────────────────────────
+    auto steps = ParseTasksFromPlanText(plan_text);
+
+    utils::TaskPanel panel;
+    if (!steps.empty()) {
+        panel.SetTasks(steps);
+        panel.ActivateFirst();
+        std::cout << "\n";
+        panel.Render();
+        std::cout << "\n";
+    }
+
+    // ── 询问是否执行 ──────────────────────────────────────────────────────
+    bool proceed = utils::AskYesNo("按照此计划开始执行？", true);
+    std::cout << "\n";
+
+    if (!proceed) {
+        panel.Clear();
+        utils::PrintInfo("已取消。可以直接输入任务描述重新开始。");
+        return;
+    }
+
+    utils::PrintHorizontalRule("开始执行");
+    RunAgentLoop(task, steps.empty() ? nullptr : &panel);
+
+    // ── 执行结束，显示最终面板状态 ────────────────────────────────────────
+    if (!steps.empty()) {
+        std::cout << "\n";
+        panel.Render();
+    }
+}
+
 // ── AI 代理循环 ───────────────────────────────────────────────────────────
 
-void Repl::RunAgentLoop(const std::string& user_message) {
+// 流式渲染器：逐字符处理 AI 输出流，完成两件事：
+//   1. 识别 <think>...</think> 块，用滚动面板（ThinkingPane）显示，标签本身不输出
+//   2. 识别并剥除 [[DONE:N]] 步骤标记，同时更新 TaskPanel
+struct StreamRenderer {
+    enum class ThinkState { kNormal, kInThink };
+
+    ThinkState           think_state_ = ThinkState::kNormal;
+    std::string          tag_buf_;   // 正在识别的 <think> 或 </think>
+    std::string          step_buf_;  // 正在识别的 [[DONE:N]]
+    utils::TaskPanel*    panel_;
+    utils::ThinkingPane* outer_pane_;  // RunAgentLoop 的外层请求进度面板
+    utils::ThinkingPane  think_pane_;  // 思考内容滚动面板
+
+    explicit StreamRenderer(utils::TaskPanel* p, utils::ThinkingPane* op)
+        : panel_(p), outer_pane_(op) {}
+
+    // 禁止拷贝/移动（ThinkingPane 内含 mutex/thread）
+    StreamRenderer(const StreamRenderer&)            = delete;
+    StreamRenderer& operator=(const StreamRenderer&) = delete;
+
+    // 喂入一个 chunk，返回可安全打印的正文文本（实时，允许返回空串）
+    std::string process(const std::string& chunk) {
+        std::string out;
+        for (char c : chunk)
+            out += process_char(c);
+        return out;
+    }
+
+    // 流结束时冲刷缓冲，确保面板关闭
+    std::string flush() {
+        std::string out;
+        if (!tag_buf_.empty()) {
+            if (think_state_ == ThinkState::kInThink)
+                think_pane_.FeedRaw(tag_buf_);
+            else
+                out += tag_buf_;
+            tag_buf_.clear();
+        }
+        if (!step_buf_.empty()) { out += step_buf_; step_buf_.clear(); }
+        if (think_state_ == ThinkState::kInThink) {
+            think_pane_.Stop();
+            think_state_ = ThinkState::kNormal;
+        }
+        return out;
+    }
+
+private:
+    void handle_done(int n) {
+        if (panel_ && n >= 1 && n <= static_cast<int>(panel_->Size()))
+            panel_->MarkDone(static_cast<size_t>(n - 1));
+    }
+
+    std::string process_char(char c) {
+        // ── [[DONE:N]] 识别（仅在正文模式下）───────────────────────────
+        if (!step_buf_.empty()) {
+            step_buf_ += c;
+            static const std::string kPfx = "[[DONE:";
+            size_t end = step_buf_.find("]]");
+            if (end != std::string::npos) {
+                std::string ns = step_buf_.substr(kPfx.size(), end - kPfx.size());
+                try { handle_done(std::stoi(ns)); } catch (...) {}
+                step_buf_.clear();
+                return "";
+            }
+            if (step_buf_.size() > 20) {
+                std::string s = step_buf_; step_buf_.clear(); return s;
+            }
+            if (step_buf_.size() <= kPfx.size() &&
+                kPfx.substr(0, step_buf_.size()) != step_buf_) {
+                std::string s = step_buf_; step_buf_.clear(); return s;
+            }
+            return "";
+        }
+
+        // ── 标签识别缓冲区非空：继续匹配 ───────────────────────────────
+        if (!tag_buf_.empty()) {
+            tag_buf_ += c;
+            return try_match_tag();
+        }
+
+        // ── 思考模式：内容喂给滚动面板 ──────────────────────────────────
+        if (think_state_ == ThinkState::kInThink) {
+            if (c == '<') { tag_buf_ += c; return ""; }  // 可能是 </think>
+            std::string s(1, c);
+            think_pane_.FeedRaw(s);
+            return "";
+        }
+
+        // ── 正文模式 ─────────────────────────────────────────────────────
+        if (c == '<') { tag_buf_ += c; return ""; }
+        if (c == '[' && panel_) { step_buf_ += c; return ""; }
+        return std::string(1, c);
+    }
+
+    std::string try_match_tag() {
+        static const std::string kOpen  = "<think>";
+        static const std::string kClose = "</think>";
+
+        if (tag_buf_ == kOpen) {
+            tag_buf_.clear();
+            think_state_ = ThinkState::kInThink;
+            // AI 以 <think> 开头时外层 pane 尚未被 first_chunk 关闭，需先停掉
+            if (outer_pane_ && outer_pane_->IsRunning())
+                outer_pane_->Stop();
+            think_pane_.Start(std::string(utils::color::kDim) +
+                              "思考中…" + utils::color::kReset);
+            return "";
+        }
+        if (tag_buf_ == kClose) {
+            tag_buf_.clear();
+            think_state_ = ThinkState::kNormal;
+            think_pane_.Stop();   // 清除面板，光标归位
+            return "";
+        }
+
+        if (kOpen.substr(0,  tag_buf_.size()) == tag_buf_) return "";
+        if (kClose.substr(0, tag_buf_.size()) == tag_buf_) return "";
+
+        // 非合法标签：按当前模式处理缓冲
+        std::string s = tag_buf_; tag_buf_.clear();
+        if (think_state_ == ThinkState::kInThink) {
+            think_pane_.FeedRaw(s);
+            return "";
+        }
+        return s;
+    }
+};
+
+void Repl::RunAgentLoop(const std::string& user_message,
+                         utils::TaskPanel* panel) {
     context_.AddUserMessage(user_message);
 
     auto& registry = ToolRegistry::GetInstance();
@@ -823,7 +1177,25 @@ void Repl::RunAgentLoop(const std::string& user_message) {
             }
         }
 
+        // ── 记录本轮开始时已完成的任务数（用于检测 [[DONE:N]] 是否触发）
+        int done_before_iter = panel ? panel->DoneCount() : 0;
+
+        // （面板渲染移到本轮工具调用完成之后，此处不再重复渲染）
+
         auto messages = context_.GetMessages();
+
+        // ── 若存在任务面板，注入步骤追踪指令 ─────────────────────────────
+        if (panel && !panel->Empty() &&
+            !messages.empty() && messages[0].role == MessageRole::kSystem) {
+            messages[0].content +=
+                "\n\n---\n## 任务追踪指令\n"
+                "你正在执行一个预定计划。每完成一个步骤（完成该步骤的所有工具调用后），"
+                "在**独立一行**输出：[[DONE:N]]（N 为步骤编号，从 1 开始）。\n"
+                "此标记会被系统自动解析并更新进度显示，**不会**展示给用户。\n"
+                "当前已完成步骤数：" +
+                std::to_string(panel->DoneCount()) + "/" +
+                std::to_string(panel->Size()) + "。";
+        }
 
         std::cout << "\n";
 
@@ -836,19 +1208,23 @@ void Repl::RunAgentLoop(const std::string& user_message) {
 
         if (cfg.stream) {
             // 状态追踪
-            bool   first_chunk    = true;   // 尚未收到第一个文字 chunk
-            bool   text_shown     = false;  // 已经有文字输出到屏幕
+            bool   first_chunk    = true;
+            bool   text_shown     = false;
             size_t tool_arg_chars = 0;
             std::string current_tool;
 
+            // 流式渲染器：处理 <think> 标签着色 + [[DONE:N]] 步骤标记剥除
+            StreamRenderer renderer(panel, &pane);
+
             response = ai_client_->ChatStream(
                 messages, tools,
-                // ── 文字流回调 ─────────────────────────────────────────
-                // 第一个文字 chunk 到达时：关闭面板，打印 AI 发言头部
+                // ── 文字流回调 ────────────────────────────────────────
                 [&](const std::string& chunk) {
+                    std::string clean = renderer.process(chunk);
+                    if (clean.empty()) return;
+
                     if (first_chunk) {
-                        pane.Stop();  // 清除思考面板
-                        // 头部与用户提示符格式一致：Termind <badge> ❯
+                        pane.Stop();
                         std::cout << utils::color::kBrightGreen
                                   << "Termind" << utils::color::kReset
                                   << " " << BuildContextBadge()
@@ -856,7 +1232,7 @@ void Repl::RunAgentLoop(const std::string& user_message) {
                                   << utils::color::kReset;
                         first_chunk = false;
                     }
-                    std::cout << chunk;
+                    std::cout << clean;
                     std::cout.flush();
                     text_shown = true;
                 },
@@ -892,10 +1268,22 @@ void Repl::RunAgentLoop(const std::string& user_message) {
                     pane.Feed(arg_chunk);
                 });
 
-            // ChatStream 返回后清除面板（工具参数或纯思考结束）
+            // 流结束：冲刷渲染器（关闭未闭合样式、输出残余缓冲）
+            {
+                std::string tail = renderer.flush();
+                if (!tail.empty()) {
+                    std::cout << tail;
+                    std::cout.flush();
+                }
+            }
             pane.Stop();
         } else {
             response = ai_client_->Chat(messages, tools);
+            // 非流式：同样过滤 <think> 标签和步骤标记
+            if (!response.content.empty()) {
+                StreamRenderer nr(panel, nullptr);
+                response.content = nr.process(response.content) + nr.flush();
+            }
             pane.Stop();
         }
 
@@ -908,7 +1296,6 @@ void Repl::RunAgentLoop(const std::string& user_message) {
         // ── 最终文字回答（无工具调用）────────────────────────────────────
         if (!response.HasToolCalls()) {
             if (!cfg.stream) {
-                // 非流式：整体打印（头部与流式一致）
                 std::cout << utils::color::kBrightGreen
                           << "Termind" << utils::color::kReset
                           << " " << BuildContextBadge()
@@ -918,6 +1305,16 @@ void Repl::RunAgentLoop(const std::string& user_message) {
             }
             std::cout << "\n";
             context_.AddAssistantMessage(response.content);
+
+            // 最终回答意味着所有工作完成：推进面板并输出整体状态
+            if (panel && !panel->Empty() && !panel->AllDone()) {
+                while (!panel->AllDone()) panel->AdvanceActive();
+                std::cout << "\n"
+                          << utils::color::kDim << "── 全部完成 ──"
+                          << utils::color::kReset << "\n";
+                panel->Render();
+                std::cout << "\n";
+            }
             break;
         }
 
@@ -931,24 +1328,46 @@ void Repl::RunAgentLoop(const std::string& user_message) {
             context_.AddToolResult(tc.id, result.output);
 
             if (result.success) {
-                // 工具输出用 dim 色折叠显示（最多显示 40 行避免刷屏）
-                auto lines = utils::Split(result.output, '\n');
-                int show = std::min(40, static_cast<int>(lines.size()));
-                for (int i = 0; i < show; ++i) {
-                    std::cout << utils::color::kDim << "  "
-                              << lines[i] << utils::color::kReset << "\n";
-                }
-                if (static_cast<int>(lines.size()) > show) {
-                    std::cout << utils::color::kDim << "  … (省略 "
-                              << lines.size() - show << " 行)"
-                              << utils::color::kReset << "\n";
+                // read_file / get_file_outline 仅保留头部，不显示详细内容
+                if (tc.name != "read_file" && tc.name != "get_file_outline") {
+                    auto lines = utils::Split(result.output, '\n');
+                    int show = std::min(40, static_cast<int>(lines.size()));
+                    for (int i = 0; i < show; ++i) {
+                        std::cout << utils::color::kDim << "  "
+                                  << lines[i] << utils::color::kReset << "\n";
+                    }
+                    if (static_cast<int>(lines.size()) > show) {
+                        std::cout << utils::color::kDim << "  … (省略 "
+                                  << lines.size() - show << " 行)"
+                                  << utils::color::kReset << "\n";
+                    }
                 }
             } else {
                 utils::PrintError("工具执行失败: " + result.output);
             }
+
+            // 用户请求中断整个任务：跳出工具循环，再跳出 agent 循环
+            if (interrupt_loop_) break;
         }
 
         std::cout << "\n";
+
+        // ── 本轮工具调用完成：推进任务、输出整体状态，再继续下一步 ──
+        if (panel && !panel->Empty()) {
+            if (panel->DoneCount() == done_before_iter) {
+                panel->AdvanceActive();
+            }
+            std::cout << utils::color::kDim << "── 步骤 "
+                      << panel->DoneCount() << "/" << panel->Size()
+                      << " 完成 ──" << utils::color::kReset << "\n";
+            panel->Render();
+            std::cout << "\n";
+        }
+
+        if (interrupt_loop_) {
+            interrupt_loop_ = false;
+            break;
+        }
     }
 
     if (iterations > cfg.max_tool_iterations) {
@@ -961,71 +1380,73 @@ void Repl::RunAgentLoop(const std::string& user_message) {
 
 ToolResult Repl::ExecuteToolWithConfirmation(const ToolCallRequest& tc) {
     auto& registry = ToolRegistry::GetInstance();
-    bool needs_confirm = registry.RequiresConfirmation(tc.name);
 
-    if (!needs_confirm) {
-        // 非破坏性操作：直接执行
-        return registry.Execute(tc.name, tc.arguments);
-    }
-
-    // 展示操作预览
+    // ── 文件写入：展示 diff，自动执行，无需确认 ─────────────────────────
     if (tc.name == "write_file") {
         std::string path_str = tc.arguments.value("path", "");
         std::string content  = tc.arguments.value("content", "");
         ShowWriteFilePreview(path_str, content);
+        auto result = registry.Execute(tc.name, tc.arguments);
+        if (result.success)
+            utils::PrintSuccess("已写入: " + path_str);
+        else
+            utils::PrintError("写入失败: " + result.output);
+        return result;
+    }
 
-    } else if (tc.name == "edit_file") {
+    // ── 精准编辑：展示 diff，自动执行，无需确认 ─────────────────────────
+    if (tc.name == "edit_file") {
         std::string path_str    = tc.arguments.value("path", "");
         std::string old_content = tc.arguments.value("old_content", "");
         std::string new_content = tc.arguments.value("new_content", "");
         ShowEditFilePreview(path_str, old_content, new_content);
+        auto result = registry.Execute(tc.name, tc.arguments);
+        if (result.success)
+            utils::PrintSuccess("已编辑: " + path_str);
+        else
+            utils::PrintError("编辑失败: " + result.output);
+        return result;
+    }
 
-    } else if (tc.name == "run_shell") {
+    // ── 非破坏性工具：直接执行 ──────────────────────────────────────────
+    if (!registry.RequiresConfirmation(tc.name))
+        return registry.Execute(tc.name, tc.arguments);
+
+    // ── run_shell 及其他需要确认的工具：展示后询问 ──────────────────────
+    if (tc.name == "run_shell") {
         std::string cmd = tc.arguments.value("command", "");
         std::cout << "\n" << utils::color::kYellow << "  $ "
                   << utils::color::kReset << cmd << "\n";
-
     } else {
         std::cout << "\n  " << tc.arguments.dump(2) << "\n";
     }
 
-    char choice = utils::AskYesNoEdit("执行此操作?");
-    std::cout << "\n";
+    bool ok = utils::AskYesNo("执行此命令?", true);
+    if (!ok) {
+        // 询问反馈：空回车=跳过，文字=给 AI 提示，q=中断整个任务
+        std::cout << utils::color::kDim
+                  << "  ↳ 反馈（直接回车跳过，输入内容重定向 AI，q 中断任务）: "
+                  << utils::color::kReset;
+        std::cout.flush();
+        std::string feedback;
+        std::getline(std::cin, feedback);
+        // 去除首尾空白
+        size_t s = feedback.find_first_not_of(" \t");
+        size_t e = feedback.find_last_not_of(" \t");
+        feedback = (s == std::string::npos) ? "" : feedback.substr(s, e - s + 1);
 
-    if (choice == 'n') {
-        return {false, "用户已拒绝该操作。"};
-    }
-
-    if (choice == 'e' &&
-        (tc.name == "write_file" || tc.name == "edit_file")) {
-        // 打开编辑器
-        std::string editor = utils::GetEnv("EDITOR", "vi");
-        std::string path_str = tc.arguments.value(
-            tc.name == "write_file" ? "path" : "path", "");
-        std::string content = tc.arguments.value(
-            tc.name == "write_file" ? "content" : "new_content", "");
-
-        // 写入临时文件
-        char tmp[] = "/tmp/termind_edit_XXXXXX";
-        int fd = mkstemp(tmp);
-        if (fd >= 0) {
-            if (write(fd, content.data(),
-                      static_cast<ssize_t>(content.size())) < 0) {}
-            close(fd);
-            std::string cmd = editor + " " + tmp;
-            if (system(cmd.c_str()) == 0) {
-                auto edited = utils::ReadFile(tmp);
-                unlink(tmp);
-                if (edited) {
-                    // 用编辑后的内容执行
-                    nlohmann::json new_args = tc.arguments;
-                    new_args[tc.name == "write_file" ? "content" : "new_content"] =
-                        *edited;
-                    return registry.Execute(tc.name, new_args);
-                }
-            }
-            unlink(tmp);
+        std::cout << "\n";
+        if (feedback == "q" || feedback == "Q") {
+            interrupt_loop_ = true;
+            utils::PrintWarning("任务已中断");
+            return {false, "用户已中断任务。"};
         }
+        if (!feedback.empty()) {
+            return {false,
+                    "用户拒绝了此操作，并给出以下反馈，请据此重新规划，"
+                    "不要再次尝试刚才的操作：\n" + feedback};
+        }
+        return {false, "用户已拒绝该操作。"};
     }
 
     return registry.Execute(tc.name, tc.arguments);
@@ -1203,19 +1624,54 @@ std::string Repl::BuildContextBadge() const {
 }
 
 // ── 构建提示符 ────────────────────────────────────────────────────────────
+// readline 需要知道提示符的可见宽度以正确换行。
+// 所有不可见的 ANSI 转义序列必须用 \001 (RL_PROMPT_START_IGNORE) 和
+// \002 (RL_PROMPT_END_IGNORE) 包裹，否则输入满一行时会回到行首覆盖提示符。
 
 std::string Repl::BuildPrompt() const {
+    // 将 ANSI 转义序列包裹为 readline 不可见区域
+    auto rl = [](const char* code) -> std::string {
+        return "\001" + std::string(code) + "\002";
+    };
+
     std::string cwd = context_.GetWorkingDir().filename().string();
     if (cwd.empty()) cwd = "/";
 
-    return std::string(utils::color::kBold) +
-           utils::color::kBrightCyan + "termind" +
-           utils::color::kReset + " " +
-           BuildContextBadge() +
-           utils::color::kDim + cwd + " " +
-           utils::color::kReset +
-           utils::color::kBrightCyan + "❯ " +
-           utils::color::kReset;
+    // BuildContextBadge() 中的 ANSI 码也需包裹；在此直接内联构建
+    const auto& cfg = ConfigManager::GetInstance().config();
+    size_t est = context_.EstimateTokens();
+    auto fmt_tok = [](size_t n) -> std::string {
+        if (n >= 1000) {
+            size_t k = n / 1000;
+            size_t r = (n % 1000) / 100;
+            if (r == 0) return std::to_string(k) + "k";
+            return std::to_string(k) + "." + std::to_string(r) + "k";
+        }
+        return std::to_string(n);
+    };
+
+    std::string badge;
+    if (cfg.max_context_tokens > 0) {
+        int limit = cfg.max_context_tokens;
+        int pct   = std::min(100, static_cast<int>(
+                        est * 100 / static_cast<size_t>(limit)));
+        const char* clr = (pct < 60) ? utils::color::kBrightGreen
+                        : (pct < 80) ? utils::color::kYellow
+                                     : utils::color::kRed;
+        badge = rl(clr) +
+                std::to_string(pct) + "% " +
+                fmt_tok(est) + "/" + fmt_tok(static_cast<size_t>(limit)) +
+                rl(utils::color::kReset) + " ";
+    } else if (est > 0) {
+        badge = rl(utils::color::kDim) + fmt_tok(est) +
+                rl(utils::color::kReset) + " ";
+    }
+
+    return rl(utils::color::kBold) + rl(utils::color::kBrightCyan) +
+           "termind" + rl(utils::color::kReset) + " " +
+           badge +
+           rl(utils::color::kDim) + cwd + " " + rl(utils::color::kReset) +
+           rl(utils::color::kBrightCyan) + "❯ " + rl(utils::color::kReset);
 }
 
 }  // namespace termind

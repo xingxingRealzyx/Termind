@@ -133,6 +133,9 @@ size_t AiClient::StreamWriteCallback(char* ptr, size_t size, size_t nmemb,
             } catch (...) {
                 // 忽略解析错误
             }
+        } else if (!line.empty()) {
+            // 非 SSE 格式的行（通常是错误响应体）
+            ctx->error_body += line + "\n";
         }
     }
 
@@ -198,7 +201,9 @@ ChatResponse AiClient::ParseResponse(const std::string& body) {
 
         // 错误响应
         if (j.contains("error")) {
-            std::string msg = j["error"].value("message", "未知 API 错误");
+            std::string msg  = j["error"].value("message", body.substr(0, 400));
+            std::string code = j["error"].value("code", "");
+            if (!code.empty()) msg = "[" + code + "] " + msg;
             return {false, msg};
         }
 
@@ -206,7 +211,7 @@ ChatResponse AiClient::ParseResponse(const std::string& body) {
         resp.success = true;
 
         if (!j.contains("choices") || j["choices"].empty())
-            return {false, "响应中没有 choices 字段"};
+            return {false, "响应中没有 choices 字段，原始响应: " + body.substr(0, 400)};
 
         const auto& choice = j["choices"][0];
         resp.finish_reason = choice.value("finish_reason", "");
@@ -308,9 +313,16 @@ ChatResponse AiClient::DoRequest(const std::string& payload, bool use_stream,
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
 
-        if (http_code != 200 && !ctx.accumulated_content.empty()) {
-            return {false, "HTTP " + std::to_string(http_code) + ": " +
-                           ctx.accumulated_content};
+        if (http_code != 200) {
+            // 优先用 SSE 内容，其次用非 SSE 错误体，最后仅报状态码
+            std::string detail;
+            if (!ctx.accumulated_content.empty())
+                detail = ctx.accumulated_content;
+            else if (!ctx.error_body.empty())
+                detail = ctx.error_body.substr(0, 800);
+            else
+                detail = "(无错误详情)";
+            return {false, "HTTP " + std::to_string(http_code) + ": " + detail};
         }
 
         response.success = true;

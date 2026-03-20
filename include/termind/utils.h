@@ -51,6 +51,7 @@ std::string FormatFileSize(std::uintmax_t bytes);
 
 // ── 终端工具 ──────────────────────────────────────────────────────────────
 int GetTerminalWidth();
+int GetTerminalHeight();
 bool IsAtty();
 std::string Repeat(const std::string& s, int n);
 void PrintHorizontalRule(const std::string& title = "");
@@ -80,29 +81,48 @@ std::string GetEnv(const std::string& name,
                    const std::string& default_val = "");
 std::string ExpandHome(const std::string& path);
 
-// ── 终端动画 Spinner ──────────────────────────────────────────────────────
-// 在后台线程显示旋转动画，调用 Stop() 后立即清除当前行。
-// 线程安全：Stop() 会等待后台线程退出再返回，之后可安全写 stdout。
-class Spinner {
+// ── 任务进度面板 TaskPanel ────────────────────────────────────────────────
+// 静态打印（无动画），调用 Render() 打印当前状态块，再次调用自动清除并重绘。
+class TaskPanel {
 public:
-    Spinner() = default;
-    ~Spinner() { Stop(); }
+    enum class Status { kPending, kActive, kDone };
 
-    Spinner(const Spinner&)            = delete;
-    Spinner& operator=(const Spinner&) = delete;
+    TaskPanel() = default;
 
-    void Start(const std::string& message);
-    void Stop();
-    void SetMessage(const std::string& message);
-    bool IsRunning() const { return running_.load(std::memory_order_relaxed); }
+    TaskPanel(const TaskPanel&)            = delete;
+    TaskPanel& operator=(const TaskPanel&) = delete;
+
+    void SetTasks(const std::vector<std::string>& descs);
+
+    // 标记第 idx 个任务完成（0-based），并自动激活下一个 Pending 任务
+    void MarkDone(size_t idx);
+
+    // 激活第一个 Pending 任务（通常在开始执行前调用）
+    void ActivateFirst();
+
+    // 将当前 Active 任务标为 Done，并激活下一个 Pending（用于自动推进）
+    void AdvanceActive();
+
+    // 清除上次渲染区域，重新打印当前状态
+    void Render();
+
+    // 仅清除上次渲染区域（不重绘）
+    void Clear();
+
+    bool   AllDone()   const;
+    int    DoneCount() const;
+    size_t Size()      const { return tasks_.size(); }
+    bool   Empty()     const { return tasks_.empty(); }
 
 private:
-    void ThreadFunc();
+    struct Task {
+        std::string desc;
+        Status      status = Status::kPending;
+    };
+    std::vector<Task> tasks_;
+    int rendered_lines_ = 0;
 
-    std::atomic<bool>  running_{false};
-    std::string        message_;
-    std::mutex         message_mutex_;
-    std::thread        thread_;
+    void DoClear();
 };
 
 // ── 多行思考预览面板 ThinkingPane ─────────────────────────────────────────
@@ -128,6 +148,9 @@ public:
     // 注入内容 chunk（线程安全）；自动展开 JSON \n \t 转义
     void Feed(const std::string& chunk);
 
+    // 注入原始文本 chunk（线程安全）；不做转义处理，适合 shell 命令输出
+    void FeedRaw(const std::string& chunk);
+
     // 停止并清除所有渲染行（可多次调用，幂等）
     void Stop();
 
@@ -135,14 +158,16 @@ public:
 
 private:
     void Loop();
-    void Render();      // 调用方必须持有 mutex_
-    void ClearLines();  // 调用方必须持有 mutex_
+    void Render();            // 调用方必须持有 mutex_：全量清除+重绘
+    void RenderSpinnerOnly(); // 调用方必须持有 mutex_：仅就地刷新 spinner 行
+    void ClearLines();        // 调用方必须持有 mutex_
     std::vector<std::string> LastLines(int width) const;  // 调用方必须持有 mutex_
 
     std::string       heading_;
     std::string       content_buf_;
-    int               rendered_lines_ = 0;
-    size_t            frame_          = 0;
+    int               rendered_lines_    = 0;
+    size_t            frame_             = 0;
+    size_t            last_content_size_ = 0;
 
     std::atomic<bool> running_{false};
     std::thread       thread_;
