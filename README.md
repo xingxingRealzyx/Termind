@@ -31,13 +31,16 @@
 
 ## 特性
 
-- 🔄 **完全 REPL 交互** — readline 历史、多行粘贴、彩色提示符
+- 🔄 **完全 REPL 交互** — readline 历史、多行粘贴、彩色提示符、上下文 token 徽章
 - 🤖 **自动工具调用循环** — AI 自主选择合适工具，迭代直到任务完成（最多 50 轮）
-- 📖 **文件上下文注入** — `/file` 命令将代码文件送入 AI 上下文
-- ✏️ **精准文件编辑** — `edit_file` 工具只替换指定片段，附带 diff 预览
-- ✅ **写操作用户确认** — 所有修改文件、执行命令操作均展示预览并等待 `y/n/e`
-- 🌊 **流式输出** — SSE 实时打印 AI 回复，Spinner 动画消除等待感
-- 🔌 **OpenAI 兼容** — 支持 GPT-4o、Claude、本地 Ollama 等任意兼容 endpoint
+- 📋 **步骤规划** — `/plan` 先输出执行计划，确认后执行，每步完成输出整体进度
+- 📖 **项目记忆** — 自动加载 `TERMIND.md`，AI 可维护项目结构、约定与待办
+- 📂 **大文件分层阅读** — `get_file_outline` 获取结构摘要，`read_file` 按行切片，节省上下文
+- 🔍 **智能符号搜索** — `search_symbol` 按语言模式查找函数/类/变量定义
+- ✏️ **精准文件编辑** — `edit_file` 只替换指定片段，附带 diff 预览
+- ✅ **选择性确认** — `write_file`/`edit_file` 展示 diff 后自动执行；`run_shell` 需用户确认
+- 🌊 **流式输出** — SSE 实时打印，`<think>` 块用滚动面板展示，终端不刷屏
+- 🔌 **OpenAI 兼容** — 支持 GPT-4o、Claude、Ollama、MiniMax 等任意兼容 endpoint
 
 ---
 
@@ -86,8 +89,8 @@ export TERMIND_MODEL=claude-3-7-sonnet-20250219
 │  │   ContextManager  │   │    AiClient      │  │ToolRegistry │ │
 │  │                   │   │                  │  │             │ │
 │  │ • 系统提示词       │   │ • Chat()         │  │ • Register  │ │
-│  │ • 文件上下文       │   │ • ChatStream()   │  │ • Execute   │ │
-│  │ • 对话历史         │   │ • SSE 流式解析   │  │ • 8 内置工具│ │
+│  │ • 项目记忆         │   │ • ChatStream()   │  │ • Execute   │ │
+│  │ • 对话历史         │   │ • SSE 流式解析   │  │ • 12+ 工具  │ │
 │  │ • GetMessages()   │   │ • 工具调用重建   │  │             │ │
 │  └───────────────────┘   └────────┬─────────┘  └──────┬──────┘ │
 │                                   │                    │        │
@@ -98,11 +101,10 @@ export TERMIND_MODEL=claude-3-7-sonnet-20250219
 │                          │ • 模型/温度     │    │read_file    │ │
 │                          │ • 配置文件/env  │    │write_file   │ │
 │                          └─────────────────┘    │edit_file    │ │
-│                                                 │list_dir     │ │
-│                                ┌─────────────┐  │search_files │ │
-│                                │  utils      │  │grep_code    │ │
-│                                │• Spinner    │  │run_shell    │ │
-│                                │• 颜色/diff  │  │get_file_info│ │
+│                                ┌─────────────┐  │search_symbol│ │
+│                                │  utils      │  │get_file_    │ │
+│                                │• TaskPanel  │  │  outline    │ │
+│                                │• Pane/diff   │  │run_shell    │ │
 │                                │• 文件读写   │  └─────────────┘ │
 │                                └─────────────┘                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -119,12 +121,12 @@ export TERMIND_MODEL=claude-3-7-sonnet-20250219
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| `Repl` | `repl.cpp` | REPL 主循环、命令分发、工具确认流程、Spinner 协调 |
+| `Repl` | `repl.cpp` | REPL 主循环、命令分发、/plan 步骤规划、工具确认流程 |
 | `AiClient` | `ai_client.cpp` | libcurl HTTP 请求、SSE 流式解析、工具调用重建 |
-| `ContextManager` | `context_manager.cpp` | 维护对话历史、文件上下文、构建 AI 消息列表 |
-| `ToolRegistry` | `tool_registry.cpp` | 工具注册/查询/执行，8 个内置 skill |
+| `ContextManager` | `context_manager.cpp` | 维护对话历史、项目记忆、构建 AI 消息列表 |
+| `ToolRegistry` | `tool_registry.cpp` | 工具注册/查询/执行，12+ 内置工具 |
 | `ConfigManager` | `config.cpp` | 单例配置，支持文件 + 环境变量双来源 |
-| `utils` | `utils.cpp` | 颜色输出、diff、Spinner 动画、文件读写、交互确认 |
+| `utils` | `utils.cpp` | TaskPanel、ThinkingPane、颜色、diff、文件读写、交互确认 |
 
 ---
 
@@ -137,7 +139,7 @@ sequenceDiagram
     participant U as 用户
     participant R as Repl
     participant C as ContextManager
-    participant S as Spinner
+    participant S as ThinkingPane
     participant A as AiClient
     participant T as ToolRegistry
     participant AI as AI API
@@ -149,14 +151,14 @@ sequenceDiagram
         R->>C: GetMessages()
         C-->>R: [system, files, history...]
         
-        R->>S: Start("思考中… (1/50)")
+        R->>S: Start("思考中…")
         R->>A: ChatStream(messages, tools, callback)
         A->>AI: POST /chat/completions (stream:true)
         
         alt AI 输出文字
             AI-->>A: SSE delta.content chunks
             A->>S: (callback 触发) Stop()
-            S-->>R: 清除 Spinner 行
+            S-->>R: 清除面板
             A-->>R: 实时打印文字 chunks
         else AI 输出工具调用
             AI-->>A: SSE delta.tool_calls chunks
@@ -177,7 +179,7 @@ sequenceDiagram
             loop 每个工具调用
                 R->>R: PrintToolCallHeader()
                 
-                alt 工具需要确认 (write_file / run_shell 等)
+                alt 工具需要确认 (run_shell)
                     R-->>U: 展示 diff / 命令预览
                     U->>R: y / n / e
                     
@@ -237,16 +239,18 @@ AI 会根据任务自动选择下列工具，循环迭代直到完成：
 
 | 工具 | 是否需确认 | 功能 |
 |------|:---:|------|
-| `read_file` | ❌ | 读取文件内容，支持 `start_line`/`end_line` 行范围 |
-| `write_file` | ✅ | 覆盖写入文件，执行前展示 diff 预览 |
-| `edit_file` | ✅ | **精准替换**文件中某段内容（推荐小改动使用） |
+| `read_file` | ❌ | 读取文件，支持 `start_line`/`end_line` 切片；大文件会提示先用 `get_file_outline` |
+| `get_file_outline` | ❌ | 获取文件结构摘要（类/函数/行号），大文件必先调用 |
+| `write_file` | 自动 | 覆盖写入，展示 diff 后自动执行 |
+| `edit_file` | 自动 | **精准替换**文件中某段内容，展示 diff 后自动执行 |
+| `search_symbol` | ❌ | 按语言模式查找函数/类/变量定义（比 grep 更精准） |
 | `list_directory` | ❌ | 列出目录内容，支持递归 |
 | `search_files` | ❌ | 按文件名 glob 模式搜索（`*.cpp`、`test_*` 等） |
 | `grep_code` | ❌ | 在代码中搜索正则，返回匹配行 + 上下文 |
-| `run_shell` | ✅ | 在工作目录执行任意 shell 命令 |
+| `run_shell` | ✅ | 在工作目录执行 shell 命令，**需用户确认** |
 | `get_file_info` | ❌ | 获取文件大小、类型、修改时间等元数据 |
 
-> ✅ 标记的工具会在执行前展示预览并等待用户确认，支持 `y`/`n`/`e`（编辑）三种选择。
+> `read_file` / `get_file_outline` 在终端仅显示头部，完整内容仍会传给 AI。
 
 ---
 
@@ -256,8 +260,11 @@ AI 会根据任务自动选择下列工具，循环迭代直到完成：
 对话
   直接输入问题或指令，AI 会自动调用工具完成任务
 
+规划
+  /plan <任务>      先输出执行计划，确认后再执行（别名: /p）
+
 文件操作
-  /file  <路径>     将文件加入 AI 上下文（AI 可直接引用其内容）
+  /file  <路径>     将文件加入 AI 上下文
   /files            列出当前上下文中的所有文件
   /clearfiles       清除文件上下文
   /add   <内容>     直接附加文字片段到上下文
@@ -273,6 +280,17 @@ AI 会根据任务自动选择下列工具，循环迭代直到完成：
 目录
   /cd    <路径>     切换工作目录（工具的相对路径基准也随之更新）
   /pwd              显示当前工作目录
+
+项目记忆
+  /memory              显示当前 TERMIND.md 内容
+  /memory init         在当前目录创建 TERMIND.md 模板
+  /memory edit         用 $EDITOR 打开 TERMIND.md
+  /memory reload       重新加载 TERMIND.md
+
+Skills
+  /skills              列出所有可用 Skills
+  /skills load <name>  手动加载 Skill 到上下文
+  /skills reload       重新扫描 Skills 目录
 
 其他
   /help             显示帮助
@@ -293,9 +311,9 @@ AI 会根据任务自动选择下列工具，循环迭代直到完成：
     "api_base_url":        "https://api.openai.com/v1",
     "model":               "gpt-4o",
     "max_tokens":          8192,
+    "max_context_tokens":  80000,
     "temperature":         0.7,
     "stream":              true,
-    "auto_approve_reads":  true,
     "max_tool_iterations": 50,
     "system_prompt":       ""
 }
