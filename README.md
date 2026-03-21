@@ -259,7 +259,7 @@ Skills
     "api_base_url":        "https://api.openai.com/v1",
     "model":               "gpt-4o",
     "max_tokens":          8192,
-    "max_context_tokens":  80000,
+    "max_context_tokens":  200000,
     "temperature":         0.7,
     "stream":              true,
     "max_tool_iterations": 50,
