@@ -35,9 +35,8 @@ std::vector<std::string> Split(const std::string& s, char delim) {
     std::vector<std::string> result;
     std::stringstream ss(s);
     std::string token;
-    while (std::getline(ss, token, delim)) {
+    while (std::getline(ss, token, delim))
         result.push_back(token);
-    }
     return result;
 }
 
@@ -75,6 +74,60 @@ std::string EscapeShellArg(const std::string& s) {
     }
     result += "'";
     return result;
+}
+
+// UTF-8 安全截断：确保截断位不落在多字节字符中间
+std::string Utf8SafeTruncate(const std::string& s, size_t max_bytes) {
+    if (s.size() <= max_bytes) return s;
+    size_t pos = max_bytes;
+    // 向前找到合法 UTF-8 起始字节（0x00-0x7F 或 0xC0+）
+    while (pos > 0 && (static_cast<unsigned char>(s[pos]) & 0xC0) == 0x80)
+        --pos;
+    return s.substr(0, pos);
+}
+
+// 将字符串中所有非法 UTF-8 字节替换为 '?'
+// 保证结果可安全传入 nlohmann/json（避免 type_error.316）
+std::string SanitizeUtf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        auto c = static_cast<unsigned char>(s[i]);
+        int seq = 0;
+        if (c < 0x80) {
+            seq = 1;                          // ASCII
+        } else if (c < 0xC0) {
+            out += '?'; ++i; continue;        // 意外的延续字节
+        } else if (c < 0xE0) {
+            seq = 2;
+        } else if (c < 0xF0) {
+            seq = 3;
+        } else if (c < 0xF8) {
+            seq = 4;
+        } else {
+            out += '?'; ++i; continue;        // 非法起始字节
+        }
+
+        // 验证后续延续字节
+        if (i + static_cast<size_t>(seq) > s.size()) {
+            out += '?'; ++i; continue;
+        }
+        bool valid = true;
+        for (int j = 1; j < seq; ++j) {
+            if ((static_cast<unsigned char>(s[i + j]) & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            out += '?'; ++i;
+        } else {
+            out.append(s, i, static_cast<size_t>(seq));
+            i += static_cast<size_t>(seq);
+        }
+    }
+    return out;
 }
 
 // ── 文件工具 ──────────────────────────────────────────────────────────────
@@ -130,17 +183,15 @@ std::string FormatFileSize(std::uintmax_t bytes) {
 
 int GetTerminalWidth() {
     struct winsize w;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) {
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
         return static_cast<int>(w.ws_col);
-    }
     return 80;
 }
 
 int GetTerminalHeight() {
     struct winsize w;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_row > 0) {
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_row > 0)
         return static_cast<int>(w.ws_row);
-    }
     return 24;
 }
 
@@ -216,14 +267,10 @@ std::string ComputeDiff(const std::string& old_content,
     int old_fd = mkstemp(old_tmp);
     if (old_fd < 0) return "(diff 不可用)";
 
-    // RAII：确保临时文件在任何退出路径都被删除
     struct TmpGuard {
         char* path;
         int   fd;
-        ~TmpGuard() {
-            if (fd >= 0) close(fd);
-            unlink(path);
-        }
+        ~TmpGuard() { if (fd >= 0) close(fd); unlink(path); }
     } old_g{old_tmp, old_fd}, new_g{new_tmp, -1};
 
     int new_fd = mkstemp(new_tmp);
@@ -259,7 +306,6 @@ std::string ComputeDiff(const std::string& old_content,
         while (fgets(buf, sizeof(buf), pipe)) result += buf;
         pclose(pipe);
     }
-
     return result.empty() ? "(无变化)" : result;
 }
 
@@ -271,7 +317,6 @@ char AskYesNoEdit(const std::string& prompt) {
               << color::kDim << "[Y]es / [n]o / [e]dit" << color::kReset
               << "  ";
     std::cout.flush();
-
     std::string line;
     if (!std::getline(std::cin, line)) return 'y';
     line = ToLower(Trim(line));
@@ -285,7 +330,6 @@ bool AskYesNo(const std::string& prompt, bool default_yes) {
               << prompt << " "
               << color::kDim << choices << color::kReset << "  ";
     std::cout.flush();
-
     std::string line;
     if (!std::getline(std::cin, line)) return default_yes;
     line = ToLower(Trim(line));
@@ -300,7 +344,6 @@ std::string AskString(const std::string& prompt,
         std::cout << color::kDim << " [" << default_val << "]" << color::kReset;
     std::cout << "  ";
     std::cout.flush();
-
     std::string line;
     std::getline(std::cin, line);
     line = Trim(line);
@@ -319,376 +362,80 @@ std::string ExpandHome(const std::string& path) {
     return GetEnv("HOME", "/tmp") + path.substr(1);
 }
 
-// ── TaskPanel ─────────────────────────────────────────────────────────────
+// ── Markdown 剥离 ──────────────────────────────────────────────────────────
 
-void TaskPanel::SetTasks(const std::vector<std::string>& descs) {
-    tasks_.clear();
-    for (const auto& d : descs)
-        tasks_.push_back({d, Status::kPending});
-    rendered_lines_ = 0;
-}
-
-void TaskPanel::MarkDone(size_t idx) {
-    if (idx < tasks_.size())
-        tasks_[idx].status = Status::kDone;
-    // 激活下一个未开始的任务
-    for (size_t i = idx + 1; i < tasks_.size(); ++i) {
-        if (tasks_[i].status == Status::kPending) {
-            tasks_[i].status = Status::kActive;
-            break;
-        }
+std::string StripMarkdownLine(const std::string& raw, bool& in_code_block) {
+    // 代码围栏 ``` (可有语言标注)
+    if (raw.size() >= 3 && raw.substr(0, 3) == "```") {
+        in_code_block = !in_code_block;
+        return "";      // 不输出围栏行
     }
-}
+    // 代码块内容原样输出（保留缩进）
+    if (in_code_block) return raw;
 
-void TaskPanel::ActivateFirst() {
-    for (auto& t : tasks_) {
-        if (t.status == Status::kPending) {
-            t.status = Status::kActive;
-            return;
-        }
+    std::string line = raw;
+
+    // 水平线
+    if (line == "---" || line == "***" || line == "___" ||
+        line == "----" || line == "====" ) {
+        return std::string(40, '-');
     }
-}
 
-void TaskPanel::AdvanceActive() {
-    // 找到当前 Active 任务 → 标为 Done
-    size_t active_idx = tasks_.size();
-    for (size_t i = 0; i < tasks_.size(); ++i) {
-        if (tasks_[i].status == Status::kActive) {
-            tasks_[i].status = Status::kDone;
-            active_idx = i;
-            break;
-        }
+    // 标题 # / ## / ### …
+    {
+        size_t i = 0;
+        while (i < line.size() && line[i] == '#') ++i;
+        if (i > 0 && i < line.size() && line[i] == ' ')
+            line = line.substr(i + 1);
     }
-    // 激活下一个 Pending 任务
-    for (size_t i = active_idx + 1; i < tasks_.size(); ++i) {
-        if (tasks_[i].status == Status::kPending) {
-            tasks_[i].status = Status::kActive;
-            break;
-        }
+
+    // 块引用 > …
+    if (!line.empty() && line[0] == '>') {
+        line = line.substr(1);
+        if (!line.empty() && line[0] == ' ') line = line.substr(1);
     }
-}
 
-void TaskPanel::DoClear() {
-    if (rendered_lines_ == 0) return;
-    std::string out = "\033[" + std::to_string(rendered_lines_) + "A\033[J";
-    ::write(STDOUT_FILENO, out.data(), out.size());
-    rendered_lines_ = 0;
-}
-
-void TaskPanel::Clear() {
-    rendered_lines_ = 0;
-}
-
-void TaskPanel::Render() {
-    DoClear();
-
-    int done  = DoneCount();
-    int total = static_cast<int>(tasks_.size());
-    int tw    = std::max(40, GetTerminalWidth());
-
+    // 内联格式：逐字符扫描去除标记
     std::string out;
-    out.reserve(2048);
-
-    // ── 顶部边框 ──────────────────────────────────────────────────────────
-    std::string badge = " 执行计划 " + std::to_string(done) + "/" +
-                        std::to_string(total) + " ";
-    int inner = tw - 2;  // ╭ 和 ╮ 各占 1 列
-    int right = inner - 1 - static_cast<int>(badge.size());
-    if (right < 0) right = 0;
-
-    out += color::kDim;
-    out += "╭─";
-    out += color::kReset;
-    out += color::kBold;
-    out += badge;
-    out += color::kReset;
-    out += color::kDim;
-    out += Repeat("─", right);
-    out += "╮\n";
-    out += color::kReset;
-    int lines = 1;
-
-    // ── 任务行 ────────────────────────────────────────────────────────────
-    for (size_t i = 0; i < tasks_.size(); ++i) {
-        const auto& t = tasks_[i];
-
-        const char* icon   = nullptr;
-        const char* c_desc = nullptr;
-        const char* c_num  = color::kDim;
-        switch (t.status) {
-            case Status::kDone:
-                icon   = "✅"; c_desc = color::kDim;          break;
-            case Status::kActive:
-                icon   = "⏳"; c_desc = color::kBrightYellow; break;
-            default:
-                icon   = "⬜"; c_desc = color::kDim;          break;
+    out.reserve(line.size());
+    size_t n = line.size();
+    for (size_t i = 0; i < n; ) {
+        // **bold** 或 __bold__
+        if (i + 1 < n &&
+            ((line[i] == '*' && line[i+1] == '*') ||
+             (line[i] == '_' && line[i+1] == '_'))) {
+            i += 2;
+            continue;
         }
-
-        std::string num  = std::to_string(i + 1) + ".";
-        // "│ " + icon(2字符宽) + " " + num + " " = 固定前缀
-        // icon 是 UTF-8 三字节但终端显示 2 列，所以不能用 size() 算宽度
-        // 保守估计前缀占 (3 + num.size() + 3) 列：│ [icon] [num] desc │
-        int prefix_cols = 3 + static_cast<int>(num.size()) + 2;
-        int max_desc    = tw - prefix_cols - 2;  // 留 2 列给右侧 " │"
-        if (max_desc < 8) max_desc = 8;
-
-        std::string desc = t.desc;
-        // 粗略截断（按字节，非完美但够用）
-        if (static_cast<int>(desc.size()) > max_desc)
-            desc = desc.substr(0, static_cast<size_t>(max_desc) - 1) + "…";
-
-        out += color::kDim;
-        out += "│ ";
-        out += color::kReset;
-        out += icon;
-        out += " ";
-        out += c_num;
-        out += num;
-        out += color::kReset;
-        out += " ";
-        out += c_desc;
-        out += desc;
-        out += color::kReset;
-        out += "\n";
-        ++lines;
-    }
-
-    // ── 底部边框 ──────────────────────────────────────────────────────────
-    out += color::kDim;
-    out += "╰";
-    out += Repeat("─", tw - 2);
-    out += "╯\n";
-    out += color::kReset;
-    ++lines;
-
-    rendered_lines_ = lines;
-    ::write(STDOUT_FILENO, out.data(), out.size());
-}
-
-
-bool TaskPanel::AllDone() const {
-    if (tasks_.empty()) return false;
-    for (const auto& t : tasks_)
-        if (t.status != Status::kDone) return false;
-    return true;
-}
-
-int TaskPanel::DoneCount() const {
-    int c = 0;
-    for (const auto& t : tasks_)
-        if (t.status == Status::kDone) ++c;
-    return c;
-}
-
-// ── ThinkingPane ──────────────────────────────────────────────────────────
-
-namespace {
-constexpr const char* kPaneFrames[] = {
-    "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
-constexpr int kPaneNumFrames = 10;
-}  // namespace
-
-void ThinkingPane::Start(const std::string& heading) {
-    if (running_.exchange(true)) return;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        heading_        = heading;
-        content_buf_.clear();
-        rendered_lines_ = 0;
-        frame_          = 0;
-        last_content_size_ = 0;
-    }
-    // 隐藏光标，避免光标在帧间跳动造成闪烁
-    if (isatty(STDOUT_FILENO)) {
-        static constexpr char kHide[] = "\033[?25l";
-        ::write(STDOUT_FILENO, kHide, sizeof(kHide) - 1);
-    }
-    thread_ = std::thread([this] { Loop(); });
-}
-
-void ThinkingPane::SetHeading(const std::string& heading) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    heading_ = heading;
-}
-
-void ThinkingPane::Feed(const std::string& chunk) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (size_t i = 0; i < chunk.size(); ++i) {
-        char c = chunk[i];
-        if (c == '\r') continue;
-        // 展开 JSON 字符串转义（工具参数里常见）
-        if (c == '\\' && i + 1 < chunk.size()) {
-            char nx = chunk[i + 1];
-            if (nx == 'n')  { content_buf_ += '\n'; ++i; continue; }
-            if (nx == 't')  { content_buf_ += '\t'; ++i; continue; }
-            if (nx == '\\') { content_buf_ += '\\'; ++i; continue; }
-            if (nx == '"')  { content_buf_ += '"';  ++i; continue; }
+        // *italic* 或 _italic_ ——只在非字母/数字边界时才是标记
+        if ((line[i] == '*' || line[i] == '_')) {
+            bool left_ok  = (i == 0)    || !std::isalnum(static_cast<unsigned char>(line[i-1]));
+            bool right_ok = (i+1 == n)  || !std::isalnum(static_cast<unsigned char>(line[i+1]));
+            if (left_ok || right_ok) { ++i; continue; }
         }
-        content_buf_ += c;
-    }
-}
-
-void ThinkingPane::FeedRaw(const std::string& chunk) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (char c : chunk) {
-        if (c == '\r') continue;
-        content_buf_ += c;
-    }
-}
-
-void ThinkingPane::Stop() {
-    if (!running_.exchange(false)) return;
-    if (thread_.joinable()) thread_.join();
-    // 后台线程已退出，可安全操作 stdout
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ClearLines();
-    }
-    // 恢复光标可见
-    if (isatty(STDOUT_FILENO)) {
-        static constexpr char kShow[] = "\033[?25h";
-        ::write(STDOUT_FILENO, kShow, sizeof(kShow) - 1);
-    }
-}
-
-void ThinkingPane::Loop() {
-    while (running_.load(std::memory_order_relaxed)) {
-        if (isatty(STDOUT_FILENO)) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            bool content_changed = (content_buf_.size() != last_content_size_);
-            last_content_size_ = content_buf_.size();
-            if (content_changed || rendered_lines_ == 0) {
-                // 有新内容：全量重绘
-                Render();
-            } else {
-                // 仅更新第一行 spinner，不擦除内容行，避免多余刷新
-                RenderSpinnerOnly();
+        // `inline code`
+        if (line[i] == '`') { ++i; continue; }
+        // [text](url) → text
+        if (line[i] == '[') {
+            size_t cb = line.find(']', i);
+            if (cb != std::string::npos && cb + 1 < n && line[cb+1] == '(') {
+                size_t cp = line.find(')', cb + 1);
+                if (cp != std::string::npos) {
+                    out += line.substr(i + 1, cb - i - 1);
+                    i = cp + 1;
+                    continue;
+                }
             }
         }
-        ++frame_;
-        std::this_thread::sleep_for(std::chrono::milliseconds(80));
-    }
-}
-
-void ThinkingPane::ClearLines() {
-    // 供 Stop() 调用：单次 write 原子擦除渲染区域
-    if (rendered_lines_ == 0) return;
-    std::string out = "\033[" + std::to_string(rendered_lines_) + "A\033[J";
-    ::write(STDOUT_FILENO, out.data(), out.size());
-    rendered_lines_ = 0;
-}
-
-void ThinkingPane::RenderSpinnerOnly() {
-    // 只刷新 spinner 行（第 1 行），内容行原地保留，避免整体擦屏引起的闪烁。
-    // 光标约定：Render() 结束后，光标在所有内容行的下一行行首。
-    // 本函数必须保持相同约定，否则下一次 Render() 的 \033[NA 会偏移。
-    if (rendered_lines_ == 0) { Render(); return; }
-
-    std::string out;
-    out.reserve(256);
-
-    // ① 上移到 spinner 行（行 1）
-    out += "\033[";
-    out += std::to_string(rendered_lines_);
-    out += "A";
-
-    // ② 擦除并重写 spinner（必须以 \n 结尾，让光标落在行 2 的行首）
-    out += "\r\033[2K";
-    out += color::kDim;
-    out += kPaneFrames[frame_ % kPaneNumFrames];
-    out += " ";
-    out += heading_;
-    out += color::kReset;
-    out += "\n";  // 光标现在在行 2 行首
-
-    // ③ 向下移到最后一行的下一行（行 rendered_lines_+1 行首）
-    //    已经在行 2，还需再下移 rendered_lines_-1 行
-    if (rendered_lines_ > 1) {
-        out += "\033[";
-        out += std::to_string(rendered_lines_ - 1);
-        out += "B";
-    }
-
-    ::write(STDOUT_FILENO, out.data(), out.size());
-}
-
-void ThinkingPane::Render() {
-    // 将清除 + 新内容合并进一个 string，最后一次 ::write() 原子输出。
-    std::string out;
-    out.reserve(1024);
-
-    // ① 清除上一帧（若有）
-    if (rendered_lines_ > 0) {
-        out += "\033[";
-        out += std::to_string(rendered_lines_);
-        out += "A\033[J";
-    }
-
-    // ② 行 1：spinner + 标题
-    out += color::kDim;
-    out += kPaneFrames[frame_ % kPaneNumFrames];
-    out += " ";
-    out += heading_;
-    out += color::kReset;
-    out += "\n";
-    int printed = 1;
-
-    // ③ 行 2..N+1：内容预览（有内容时才输出）
-    if (!content_buf_.empty()) {
-        int tw = GetTerminalWidth();
-        int pw = std::max(20, tw - 6);
-        for (const auto& ln : LastLines(pw)) {
-            out += color::kDim;
-            out += "  ╎ ";
-            out += ln;
-            out += color::kReset;
-            out += "\n";
-            ++printed;
+        // ![alt](url) → (删除图片)
+        if (line[i] == '!' && i + 1 < n && line[i+1] == '[') {
+            size_t cb = line.find(']', i);
+            if (cb != std::string::npos && cb + 1 < n && line[cb+1] == '(') {
+                size_t cp = line.find(')', cb + 1);
+                if (cp != std::string::npos) { i = cp + 1; continue; }
+            }
         }
-    }
-
-    rendered_lines_ = printed;
-
-    // ④ 单次系统调用写出，避免多次写之间的撕裂
-    ::write(STDOUT_FILENO, out.data(), out.size());
-}
-
-std::vector<std::string> ThinkingPane::LastLines(int width) const {
-    // 按 \n 分割 content_buf_
-    std::vector<std::string> raw;
-    std::string cur;
-    for (char c : content_buf_) {
-        if (c == '\n') {
-            raw.push_back(cur);
-            cur.clear();
-        } else if (c == '\t') {
-            cur += "    ";
-        } else {
-            cur += c;
-        }
-    }
-    if (!cur.empty()) raw.push_back(cur);
-
-    // 过滤纯空白行
-    std::vector<std::string> lines;
-    for (const auto& l : raw) {
-        bool blank = true;
-        for (unsigned char c : l) {
-            if (!std::isspace(c)) { blank = false; break; }
-        }
-        if (!blank) lines.push_back(l);
-    }
-
-    // 取最后 kPreviewLines 行，超宽截断
-    int start = std::max(0, static_cast<int>(lines.size()) - kPreviewLines);
-    std::vector<std::string> out;
-    for (int i = start; i < static_cast<int>(lines.size()); ++i) {
-        const std::string& l = lines[i];
-        if (static_cast<int>(l.size()) <= width) {
-            out.push_back(l);
-        } else {
-            out.push_back(l.substr(0, static_cast<size_t>(width) - 1) + "…");
-        }
+        out += line[i++];
     }
     return out;
 }

@@ -1,6 +1,7 @@
 #include "termind/tool_registry.h"
 #include "termind/skill_manager.h"
 #include "termind/utils.h"
+#include "termind/tui.h"
 
 #include <algorithm>
 #include <chrono>
@@ -77,13 +78,17 @@ ToolResult ToolRegistry::Execute(const std::string& name,
     if (it == tools_.end()) {
         return {false, "未知工具: " + name};
     }
+    ToolResult result;
     try {
-        return it->second.function(args);
+        result = it->second.function(args);
     } catch (const nlohmann::json::exception& e) {
         return {false, std::string("参数错误: ") + e.what()};
     } catch (const std::exception& e) {
         return {false, std::string("工具执行错误: ") + e.what()};
     }
+    // 统一净化：确保输出中不含非法 UTF-8 字节，避免 nlohmann/json 序列化崩溃
+    result.output = utils::SanitizeUtf8(result.output);
+    return result;
 }
 
 bool ToolRegistry::HasTool(const std::string& name) const {
@@ -598,8 +603,35 @@ void RegisterBuiltinTools(ToolRegistry& registry,
             std::string full_cmd = "cd " + utils::EscapeShellArg(wd.string()) +
                                    " && " + command + " 2>&1";
 
-            FILE* pipe = popen(full_cmd.c_str(), "r");
-            if (!pipe) return {false, "无法启动命令"};
+            // 用 pipe + fork + exec 替代 popen，获取 shell 子进程 PID
+            // 这样可以用 waitpid(WNOHANG) 检测 shell 是否退出，避免
+            // 因后台进程持有管道写端而永久阻塞
+            int pipefd[2];
+            if (pipe(pipefd) < 0)
+                return {false, "无法创建管道"};
+
+            pid_t child_pid = fork();
+            if (child_pid < 0) {
+                close(pipefd[0]); close(pipefd[1]);
+                return {false, "无法创建子进程"};
+            }
+            if (child_pid == 0) {
+                // 子进程：创建新进程组（使自己成为组长）
+                // 这样执行结束后可以用 killpg 一次性清理所有后台子进程
+                setpgid(0, 0);
+                // 将 stdout/stderr 重定向到管道写端
+                close(pipefd[0]);
+                dup2(pipefd[1], STDOUT_FILENO);
+                dup2(pipefd[1], STDERR_FILENO);
+                close(pipefd[1]);
+                execl("/bin/sh", "sh", "-c", full_cmd.c_str(), nullptr);
+                _exit(127);
+            }
+            // 父进程：确保子进程组已建立（防止 kill 时 pgid 还未设置）
+            setpgid(child_pid, child_pid);
+            // 关闭写端（关键：保证 shell 退出后管道真正 EOF）
+            close(pipefd[1]);
+            int fd = pipefd[0];
 
             // 截断命令标题（太长时省略中间部分）
             auto make_heading = [](const std::string& cmd) -> std::string {
@@ -614,16 +646,16 @@ void RegisterBuiltinTools(ToolRegistry& registry,
                        utils::color::kReset;
             };
 
-            utils::ThinkingPane pane;
+            tui::ThinkingPane pane;
             pane.Start(make_heading(command));
 
-            // 用 poll() + 非阻塞读替代阻塞 fgets，解决后台进程（&）占住管道
-            // 导致永久阻塞的问题
-            int fd = fileno(pipe);
             fcntl(fd, F_SETFL, O_NONBLOCK);
 
-            // 空闲超时：连续 30 秒无新输出时停止等待（处理 & 后台进程）
-            // 硬性超时：总计 120 秒（兜底）
+            // ── 超时策略 ──────────────────────────────────────────────────────
+            // 1. waitpid(WNOHANG)：shell 退出即立刻结束，解决后台进程持管道问题
+            // 2. 空闲超时 kIdleSecs：shell 还在运行但管道长时间无输出
+            //    （如 curl 等待无响应服务器），杀掉 shell 并返回
+            // 3. 硬性超时 kHardSecs：绝对兜底
             constexpr int kIdleSecs = 30;
             constexpr int kHardSecs = 120;
 
@@ -631,8 +663,10 @@ void RegisterBuiltinTools(ToolRegistry& registry,
             auto last_data  = wall_start;
 
             std::string output;
-            bool truncated  = false;
-            bool timed_out  = false;
+            bool truncated    = false;
+            bool timed_out    = false;
+            bool shell_exited = false;
+            int  shell_status = 0;
             char buf[4096];
 
             while (true) {
@@ -649,6 +683,36 @@ void RegisterBuiltinTools(ToolRegistry& registry,
                     break;
                 }
 
+                // 优先：检测 shell 子进程是否已退出（不阻塞）
+                // shell 退出即表示脚本执行完毕，无论后台进程是否还活着
+                if (!shell_exited) {
+                    int ws = 0;
+                    pid_t r = waitpid(child_pid, &ws, WNOHANG);
+                    if (r == child_pid) {
+                        shell_exited = true;
+                        shell_status = ws;
+                        // 排干管道中剩余数据后结束
+                        while (true) {
+                            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                            if (n <= 0) break;
+                            buf[n] = '\0';
+                            std::string chunk(buf, static_cast<size_t>(n));
+                            pane.FeedRaw(chunk);
+                            output += chunk;
+                        }
+                        break;
+                    }
+
+                    // shell 仍在运行，检查空闲超时
+                    // （处理 curl/nc 等前台命令挂起的情况）
+                    if (idle_secs >= kIdleSecs) {
+                        output += "\n[空闲超时：" + std::to_string(kIdleSecs) +
+                                  " 秒无新输出，shell 仍在运行，已终止]\n";
+                        timed_out = true;
+                        break;
+                    }
+                }
+
                 struct pollfd pfd{fd, POLLIN, 0};
                 int ret = poll(&pfd, 1, 200);  // 每 200ms 轮询一次
 
@@ -657,21 +721,8 @@ void RegisterBuiltinTools(ToolRegistry& registry,
                     break;
                 }
 
-                if (ret == 0) {
-                    // 200ms 内无数据
-                    if (!output.empty() && idle_secs >= kIdleSecs) {
-                        // 已有输出，但超过空闲阈值 → 后台进程占管道，退出等待
-                        output += "\n[空闲超时：" + std::to_string(kIdleSecs) +
-                                  " 秒无新输出，已停止等待（后台进程可能仍在运行）]\n";
-                        timed_out = true;
-                        break;
-                    }
-                    continue;
-                }
-
-                // 有事件
                 if (pfd.revents & (POLLHUP | POLLERR)) {
-                    // 管道关闭，排干剩余数据
+                    // 管道关闭（所有写端均已关闭），排干剩余数据
                     while (true) {
                         ssize_t n = read(fd, buf, sizeof(buf) - 1);
                         if (n <= 0) break;
@@ -688,7 +739,7 @@ void RegisterBuiltinTools(ToolRegistry& registry,
                     if (n < 0 && errno == EAGAIN) continue;
                     if (n <= 0) break;  // EOF
                     buf[n] = '\0';
-                    last_data = now;
+                    last_data = now;  // 重置空闲计时器
                     std::string chunk(buf, static_cast<size_t>(n));
                     pane.FeedRaw(chunk);
                     output += chunk;
@@ -700,15 +751,43 @@ void RegisterBuiltinTools(ToolRegistry& registry,
                 }
             }
 
-            // pclose 等待 shell 子进程退出；若子进程已退出则立即返回
-            int status = pclose(pipe);
+            close(fd);
+
+            // 清理：杀掉整个进程组（shell + 所有后台子进程）
+            // 使用 killpg 而非 kill，确保 http_server / curl 等后台进程一并清理
+            {
+                int ws = 0;
+                if (!shell_exited) {
+                    // shell 还在运行（超时/截断）：先温和后强制
+                    killpg(child_pid, SIGTERM);
+                    for (int i = 0; i < 10; ++i) {
+                        usleep(200000);
+                        if (waitpid(child_pid, &ws, WNOHANG) == child_pid) {
+                            shell_exited = true;
+                            shell_status = ws;
+                            break;
+                        }
+                    }
+                    if (!shell_exited) {
+                        killpg(child_pid, SIGKILL);
+                        waitpid(child_pid, &ws, 0);
+                        shell_status = ws;
+                    }
+                } else {
+                    // shell 已正常退出，但后台进程可能还在运行，一并清理
+                    killpg(child_pid, SIGTERM);
+                    usleep(300000);
+                    killpg(child_pid, SIGKILL);  // 忽略"no such process"错误
+                }
+            }
+
             pane.Stop();
 
-            int exit_code = (WIFEXITED(status) && !timed_out)
-                                ? WEXITSTATUS(status) : -1;
+            int exit_code = (!timed_out && WIFEXITED(shell_status))
+                                ? WEXITSTATUS(shell_status) : -1;
 
             std::ostringstream ss;
-            ss << "$ " << command << "\n" << output;
+            ss << "$ " << command << "\n" << output;  // Execute() 出口统一 SanitizeUtf8
             if (truncated || timed_out)
                 ss << "\n[退出码: 未知]";
             else

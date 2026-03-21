@@ -19,9 +19,9 @@
 
 - [特性](#特性)
 - [快速开始](#快速开始)
+- [TUI 界面](#tui-界面)
 - [架构](#架构)
-- [时序图](#时序图)
-- [内置工具（Skills）](#内置工具skills)
+- [内置工具](#内置工具)
 - [REPL 命令](#repl-命令)
 - [配置](#配置)
 - [构建](#构建)
@@ -31,15 +31,14 @@
 
 ## 特性
 
-- 🔄 **完全 REPL 交互** — readline 历史、多行粘贴、彩色提示符、上下文 token 徽章
-- 🤖 **自动工具调用循环** — AI 自主选择合适工具，迭代直到任务完成（最多 50 轮）
-- 📋 **步骤规划** — `/plan` 先输出执行计划，确认后执行，每步完成输出整体进度
+- 🖥️ **现代 TUI** — 基于 FTXUI 的交互式输入框，支持多行编辑、命令补全下拉、`@文件` 引用
+- 🤖 **自动工具调用循环** — AI 自主选择工具，迭代直到任务完成（最多 50 轮）
 - 📖 **项目记忆** — 自动加载 `TERMIND.md`，AI 可维护项目结构、约定与待办
 - 📂 **大文件分层阅读** — `get_file_outline` 获取结构摘要，`read_file` 按行切片，节省上下文
 - 🔍 **智能符号搜索** — `search_symbol` 按语言模式查找函数/类/变量定义
 - ✏️ **精准文件编辑** — `edit_file` 只替换指定片段，附带 diff 预览
 - ✅ **选择性确认** — `write_file`/`edit_file` 展示 diff 后自动执行；`run_shell` 需用户确认
-- 🌊 **流式输出** — SSE 实时打印，`<think>` 块用滚动面板展示，终端不刷屏
+- 🌊 **流式输出** — SSE 实时打印，`<think>` 内容在带框思考面板中滚动，正文自动剥除 Markdown 符号
 - 🔌 **OpenAI 兼容** — 支持 GPT-4o、Claude、Ollama、MiniMax 等任意兼容 endpoint
 
 ---
@@ -47,17 +46,19 @@
 ## 快速开始
 
 ```bash
-# 1. 设置 API Key（支持 OpenAI、Anthropic 或兼容 endpoint）
+# 1. 设置 API Key
 export TERMIND_API_KEY=sk-...
 export TERMIND_MODEL=gpt-4o          # 可选，默认 gpt-4o
 
-# 2. 构建
+# 2. 构建并安装
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
+cmake --install . --prefix ~/.local  # 安装到 ~/.local/bin/termind
 
-# 3. 启动
-./termind
+# 3. 在任意目录启动
+cd /your/project
+termind
 ```
 
 使用自定义 endpoint（如 Ollama 或 Claude）：
@@ -65,8 +66,59 @@ make -j$(nproc)
 ```bash
 export TERMIND_API_BASE_URL=https://api.anthropic.com/v1
 export TERMIND_MODEL=claude-3-7-sonnet-20250219
-./termind
+termind
 ```
+
+---
+
+## TUI 界面
+
+### 交互式输入框
+
+Termind 使用 [FTXUI](https://github.com/ArthurSonzogni/FTXUI) 实现类 GUI 风格的终端输入框：
+
+| 操作 | 快捷键 |
+|------|--------|
+| 发送消息 | `Enter` |
+| 插入换行（多行输入）| `Alt+Enter` |
+| 清空输入 | `Escape` / `Ctrl+C` |
+| 退出 | `Ctrl+D` |
+| 历史回溯 | `←`（光标在行首时） |
+| 历史前进 | `→`（光标在行尾且在历史模式时） |
+| 接受补全 | `Tab` |
+| 在补全列表中导航 | `↑` / `↓` |
+
+### 命令补全
+
+输入 `/` 时自动弹出命令下拉列表，显示名称与说明，超出 8 条时可滚动。
+
+### 文件引用 `@`
+
+在消息中使用 `@` 插入文件内容到上下文：
+
+```
+# 完整文件
+@src/server.cpp
+
+# 指定行范围
+@src/server.cpp:42-80
+
+# 多个文件（可连续写，无需空格分隔）
+@include/server.h@src/server.cpp:1-50
+
+# Tab 补全路径
+输入 @ 后列出当前目录文件，Tab 接受第一个匹配
+```
+
+### 思考面板
+
+`<think>` 标签内的内容不在主输出中显示，而是在带边框的思考面板中实时滚动，面板标题栏显示旋转进度指示器。
+
+### 工具输出卡片
+
+- **读取文件**：连续的 `read_file`/`get_file_outline` 调用合并为一张 `Read files` 卡片
+- **写入/编辑**：展示 diff 预览后执行，结果显示在带框输出中
+- **Shell 命令**：输出在带标题框的滚动区域中实时显示
 
 ---
 
@@ -76,37 +128,34 @@ export TERMIND_MODEL=claude-3-7-sonnet-20250219
 ┌─────────────────────────────────────────────────────────────────┐
 │                        termind 进程                              │
 │                                                                 │
-│  ┌──────────┐   用户输入    ┌─────────────────────────────────┐ │
-│  │          │ ──────────→  │            Repl                 │ │
-│  │ readline │              │  • 斜杠命令分发                  │ │
-│  │ history  │ ←──────────  │  • RunAgentLoop                 │ │
-│  └──────────┘   提示符     │  • 工具确认 / diff 预览          │ │
-│                            └────────────┬────────────────────┘ │
-│                                         │                       │
-│              ┌──────────────────────────┼──────────────┐        │
-│              ↓                          ↓              ↓        │
-│  ┌───────────────────┐   ┌──────────────────┐  ┌─────────────┐ │
-│  │   ContextManager  │   │    AiClient      │  │ToolRegistry │ │
-│  │                   │   │                  │  │             │ │
-│  │ • 系统提示词       │   │ • Chat()         │  │ • Register  │ │
-│  │ • 项目记忆         │   │ • ChatStream()   │  │ • Execute   │ │
-│  │ • 对话历史         │   │ • SSE 流式解析   │  │ • 12+ 工具  │ │
-│  │ • GetMessages()   │   │ • 工具调用重建   │  │             │ │
-│  └───────────────────┘   └────────┬─────────┘  └──────┬──────┘ │
-│                                   │                    │        │
-│                          ┌────────↓────────┐           │        │
-│                          │  ConfigManager  │           │        │
-│                          │                 │    ┌──────↓──────┐ │
-│                          │ • API Key/URL   │    │    Tools    │ │
-│                          │ • 模型/温度     │    │read_file    │ │
-│                          │ • 配置文件/env  │    │write_file   │ │
-│                          └─────────────────┘    │edit_file    │ │
-│                                ┌─────────────┐  │search_symbol│ │
-│                                │  utils      │  │get_file_    │ │
-│                                │• TaskPanel  │  │  outline    │ │
-│                                │• Pane/diff   │  │run_shell    │ │
-│                                │• 文件读写   │  └─────────────┘ │
-│                                └─────────────┘                  │
+│  ┌──────────────────┐  用户输入   ┌───────────────────────────┐ │
+│  │   FTXUI Input    │ ─────────→  │           Repl            │ │
+│  │  • 多行编辑       │             │  • 命令分发               │ │
+│  │  • 命令补全       │ ←─────────  │  • RunAgentLoop           │ │
+│  │  • @文件引用      │  提示符     │  • 工具确认 / diff 预览   │ │
+│  └──────────────────┘             └───────────┬───────────────┘ │
+│                                               │                  │
+│              ┌────────────────────────────────┼────────────┐     │
+│              ↓                                ↓            ↓     │
+│  ┌───────────────────┐   ┌──────────────────┐  ┌─────────────┐  │
+│  │   ContextManager  │   │    AiClient      │  │ToolRegistry │  │
+│  │ • 系统提示词       │   │ • Chat()         │  │ • Register  │  │
+│  │ • 项目记忆         │   │ • ChatStream()   │  │ • Execute   │  │
+│  │ • 对话历史         │   │ • SSE 流式解析   │  │ • 12+ 工具  │  │
+│  └───────────────────┘   └────────┬─────────┘  └──────┬──────┘  │
+│                                   │                    │         │
+│                          ┌────────↓────────┐    ┌──────↓──────┐  │
+│                          │  ConfigManager  │    │    Tools    │  │
+│                          │ • API Key/URL   │    │ read_file   │  │
+│                          │ • 模型/温度     │    │ write_file  │  │
+│                          └─────────────────┘    │ edit_file   │  │
+│                                                 │ run_shell   │  │
+│  ┌────────────────────────┐                     │ search_*    │  │
+│  │       tui.cpp          │                     └─────────────┘  │
+│  │ • ThinkingPane（思考框）│                                       │
+│  │ • StreamRenderer        │                                       │
+│  │ • FTXUI 卡片渲染        │                                       │
+│  └────────────────────────┘                                       │
 └─────────────────────────────────────────────────────────────────┘
                                    │ libcurl
                                    ↓
@@ -121,136 +170,35 @@ export TERMIND_MODEL=claude-3-7-sonnet-20250219
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| `Repl` | `repl.cpp` | REPL 主循环、命令分发、/plan 步骤规划、工具确认流程 |
+| `Repl` | `repl.cpp` | REPL 主循环、FTXUI 输入、命令分发、工具确认 |
 | `AiClient` | `ai_client.cpp` | libcurl HTTP 请求、SSE 流式解析、工具调用重建 |
 | `ContextManager` | `context_manager.cpp` | 维护对话历史、项目记忆、构建 AI 消息列表 |
 | `ToolRegistry` | `tool_registry.cpp` | 工具注册/查询/执行，12+ 内置工具 |
 | `ConfigManager` | `config.cpp` | 单例配置，支持文件 + 环境变量双来源 |
-| `utils` | `utils.cpp` | TaskPanel、ThinkingPane、颜色、diff、文件读写、交互确认 |
+| `tui` | `tui.cpp` | ThinkingPane、StreamRenderer、FTXUI 卡片渲染 |
+| `utils` | `utils.cpp` | 颜色、diff、文件读写、UTF-8 处理、Markdown 剥离 |
 
 ---
 
-## 时序图
-
-### 普通对话（有工具调用）
-
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant R as Repl
-    participant C as ContextManager
-    participant S as ThinkingPane
-    participant A as AiClient
-    participant T as ToolRegistry
-    participant AI as AI API
-
-    U->>R: 输入问题
-    R->>C: AddUserMessage(query)
-    
-    loop 工具调用循环（最多 50 轮）
-        R->>C: GetMessages()
-        C-->>R: [system, files, history...]
-        
-        R->>S: Start("思考中…")
-        R->>A: ChatStream(messages, tools, callback)
-        A->>AI: POST /chat/completions (stream:true)
-        
-        alt AI 输出文字
-            AI-->>A: SSE delta.content chunks
-            A->>S: (callback 触发) Stop()
-            S-->>R: 清除面板
-            A-->>R: 实时打印文字 chunks
-        else AI 输出工具调用
-            AI-->>A: SSE delta.tool_calls chunks
-            A->>A: 累积 partial tool calls
-        end
-        
-        AI-->>A: finish_reason: stop | tool_calls
-        A-->>R: ChatResponse
-        R->>S: Stop()（幂等）
-        
-        alt finish_reason == stop
-            R->>C: AddAssistantMessage(content)
-            R-->>U: 打印最终回答
-            Note over R: 退出循环
-        else finish_reason == tool_calls
-            R->>C: AddAssistantToolCalls(calls)
-            
-            loop 每个工具调用
-                R->>R: PrintToolCallHeader()
-                
-                alt 工具需要确认 (run_shell)
-                    R-->>U: 展示 diff / 命令预览
-                    U->>R: y / n / e
-                    
-                    alt 用户选 e (编辑)
-                        R->>U: 打开 $EDITOR
-                        U-->>R: 编辑后内容
-                    end
-                end
-                
-                R->>T: Execute(name, args)
-                T-->>R: ToolResult
-                R->>C: AddToolResult(id, output)
-            end
-        end
-    end
-```
-
-### 文件写入确认流程
-
-```mermaid
-sequenceDiagram
-    participant AI as AI API
-    participant R as Repl
-    participant T as ToolRegistry
-    participant FS as 文件系统
-    participant U as 用户
-
-    AI-->>R: tool_call: write_file(path, content)
-    R->>FS: ReadFile(path) — 读取旧内容
-    R->>R: ComputeDiff(old, new)
-    R-->>U: 展示彩色 diff 预览
-
-    U->>R: 输入 y / n / e
-
-    alt y — 确认写入
-        R->>T: Execute("write_file", args)
-        T->>FS: WriteFile(path, content)
-        FS-->>T: 成功
-        T-->>R: ToolResult{success=true}
-    else n — 拒绝
-        R-->>AI: tool_result: "用户已拒绝该操作"
-    else e — 手动编辑
-        R->>U: 打开 $EDITOR 编辑临时文件
-        U-->>R: 保存编辑后内容
-        R->>T: Execute("write_file", edited_args)
-        T->>FS: WriteFile(path, edited_content)
-    end
-
-    R->>AI: 继续下一轮对话
-```
-
----
-
-## 内置工具（Skills）
+## 内置工具
 
 AI 会根据任务自动选择下列工具，循环迭代直到完成：
 
 | 工具 | 是否需确认 | 功能 |
 |------|:---:|------|
-| `read_file` | ❌ | 读取文件，支持 `start_line`/`end_line` 切片；大文件会提示先用 `get_file_outline` |
+| `read_file` | ❌ | 读取文件，支持 `start_line`/`end_line` 切片 |
 | `get_file_outline` | ❌ | 获取文件结构摘要（类/函数/行号），大文件必先调用 |
 | `write_file` | 自动 | 覆盖写入，展示 diff 后自动执行 |
 | `edit_file` | 自动 | **精准替换**文件中某段内容，展示 diff 后自动执行 |
-| `search_symbol` | ❌ | 按语言模式查找函数/类/变量定义（比 grep 更精准） |
+| `search_symbol` | ❌ | 按语言模式查找函数/类/变量定义 |
 | `list_directory` | ❌ | 列出目录内容，支持递归 |
 | `search_files` | ❌ | 按文件名 glob 模式搜索（`*.cpp`、`test_*` 等） |
 | `grep_code` | ❌ | 在代码中搜索正则，返回匹配行 + 上下文 |
 | `run_shell` | ✅ | 在工作目录执行 shell 命令，**需用户确认** |
 | `get_file_info` | ❌ | 获取文件大小、类型、修改时间等元数据 |
+| `update_project_memory` | ❌ | 更新 `TERMIND.md` 项目记忆 |
 
-> `read_file` / `get_file_outline` 在终端仅显示头部，完整内容仍会传给 AI。
+> 读取工具（`read_file` / `get_file_outline`）的连续调用会在终端合并为一张卡片显示。
 
 ---
 
@@ -261,7 +209,7 @@ AI 会根据任务自动选择下列工具，循环迭代直到完成：
   直接输入问题或指令，AI 会自动调用工具完成任务
 
 规划
-  /plan <任务>      先输出执行计划，确认后再执行（别名: /p）
+  /plan <任务>      先输出执行计划，确认后再执行
 
 文件操作
   /file  <路径>     将文件加入 AI 上下文
@@ -294,7 +242,7 @@ Skills
 
 其他
   /help             显示帮助
-  /quit             退出（自动保存 readline 历史）
+  /quit             退出
 ```
 
 ---
@@ -331,7 +279,7 @@ Skills
 ### 命令行参数
 
 ```
-./termind [选项]
+termind [选项]
 
   -c, --config <路径>   指定配置文件
   -m, --model  <名称>   覆盖模型
@@ -352,8 +300,9 @@ Skills
 | CMake | ≥ 3.20 | 构建系统 |
 | GCC / Clang | 支持 C++17 | 编译器 |
 | libcurl | 任意 | HTTP 请求 |
-| readline | 任意 | REPL 输入 |
+| readline | 任意 | 历史文件兼容 |
 | nlohmann/json | 3.11.3 | JSON（CMake 自动下载） |
+| FTXUI | 6.1.9 | TUI 框架（CMake 自动下载） |
 
 Ubuntu / Debian 安装依赖：
 
@@ -366,16 +315,16 @@ sudo apt install build-essential cmake libcurl4-openssl-dev libreadline-dev
 ```bash
 mkdir build && cd build
 
-# Debug（含调试符号）
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j$(nproc)
-
-# Release（优化）
+# Release（推荐）
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
-# 安装到系统（可选）
-sudo make install
+# 安装到用户目录（无需 sudo）
+cmake --install . --prefix ~/.local
+# 确保 ~/.local/bin 在 PATH 中，之后可在任意目录运行 termind
+
+# 安装到系统（可选，需要 sudo）
+sudo cmake --install .
 ```
 
 ---
@@ -389,6 +338,7 @@ sudo make install
 | Ollama（本地）| `http://localhost:11434/v1` | `qwen2.5-coder:32b` |
 | DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
 | 月之暗面 | `https://api.moonshot.cn/v1` | `moonshot-v1-32k` |
+| MiniMax | `https://api.minimax.chat/v1` | `MiniMax-M2.7-highspeed` |
 
 ---
 

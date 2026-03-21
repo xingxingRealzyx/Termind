@@ -63,10 +63,9 @@ private:
     void HandleMemory(const std::string& args);
 
     // ── AI 代理循环 ───────────────────────────────────────────────────────
-    // 发送用户消息，循环处理工具调用，直到得到最终答复
-    // 若提供 panel，则在每轮迭代间渲染任务进度，并从 AI 输出中解析 [[DONE:N]] 标记
+    // 发送用户消息，循环处理工具调用，直到得到最终答复。
     void RunAgentLoop(const std::string& user_message,
-                      utils::TaskPanel* panel = nullptr);
+                      bool skip_add_user = false);
 
     // ── 工具执行（含确认流程）────────────────────────────────────────────
     ToolResult ExecuteToolWithConfirmation(const ToolCallRequest& tc);
@@ -82,9 +81,6 @@ private:
 
     // ── 显示 ──────────────────────────────────────────────────────────────
     void PrintWelcome() const;
-    std::string BuildPrompt() const;
-    // 生成带颜色的上下文 token 徽章，供提示符和 AI 回答头部共用
-    // 格式："42% 34k/80k "（启用压缩）或 "34k "（禁用）
     std::string BuildContextBadge() const;
     void PrintToolCallHeader(const ToolCallRequest& tc) const;
 

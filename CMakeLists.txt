@@ -27,6 +27,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+# FTXUI – TUI 渲染（自动处理 CJK 宽字符、边框对齐）
+set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    ftxui
+    GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI
+    GIT_TAG        v6.1.9
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(ftxui)
+
 # readline
 find_library(READLINE_LIB NAMES readline REQUIRED)
 find_path(READLINE_INCLUDE_DIR NAMES readline/readline.h REQUIRED)
@@ -36,6 +48,7 @@ set(SOURCES
     src/main.cpp
     src/config.cpp
     src/utils.cpp
+    src/tui.cpp
     src/skill_manager.cpp
     src/tool_registry.cpp
     src/ai_client.cpp
@@ -55,6 +68,9 @@ target_link_libraries(termind PRIVATE
     Threads::Threads
     nlohmann_json::nlohmann_json
     ${READLINE_LIB}
+    ftxui::screen
+    ftxui::dom
+    ftxui::component
 )
 
 target_compile_options(termind PRIVATE
